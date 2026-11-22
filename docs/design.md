@@ -1634,3 +1634,210 @@ and which record so the canonicalisation gap can be closed.
 
 The honest summary: **L1 is the design, L2 and L3 are economy, and L4 is the
 admission that canonicalisation is a thing humans maintain.**
+
+---
+
+## 10. The 6-hour outage: what is on disk, how we drain it, the arithmetic
+
+### 10.1 What the outage is
+
+Six hours in which the Salesforce record API is unreachable and webhooks
+Salesforce tried to send may never arrive. Per A16 I design for both directions
+being dark at once, which is the harder reading of the brief and the one its two
+sentences jointly imply.
+
+**The portal keeps working throughout.** Finance and customer-success staff
+edit records, their edits apply locally, appear immediately in the portal, and
+queue for Salesforce. Nothing is read-only and nothing is refused. The only
+thing the outage costs is visibility in Salesforce, and the 30-second target
+does not apply during it — the exercise is explicit that catch-up is a
+different target, and the number we commit to instead is the drain time in
+10.4.
+
+### 10.2 What is on disk
+
+| On disk | At the worst moment | Why it is there |
+| --- | --- | --- |
+| `outbound_change` rows, `state='pending'` | **19,440 rows, ~4.9 MB** | each committed in the same transaction as the portal edit that caused it (part 6.1) |
+| rows left `inflight` by a restart | a handful | reclaimed when their 30-second lease expires (part 6.6) |
+| `sync_watermark` | one row per object type | where the inbound sweep will resume from |
+| `field_change`, `field_version`, typed rows | normal growth | the portal is fully operational; local history is complete |
+
+Five megabytes. That is what "pending calls to Salesforce must still be there
+after our own process restarts" costs, and it is worth stating plainly because
+the requirement sounds expensive and is not.
+
+**A restart during the outage is a non-event.** The rows are committed, so they
+survive; leases expire and the rows return to `pending`; the circuit breaker
+starts closed, opens again on its first five failures, and resumes probing.
+Nothing is lost and nothing needs a human.
+
+### 10.3 How we drain it — and why the order is not negotiable
+
+The recovery has a strict ordering requirement that took me a second pass to
+see, so it goes first:
+
+> **The inbound sweep must complete before the outbound drain begins.**
+
+Here is the loss it prevents. Finance sets a contact's city to Noida at 15:00;
+the row queues unsent. At 17:00 a sales user sets the same city to Delhi in
+Salesforce; that webhook never arrives. The link returns at 21:00.
+
+- *Drain first:* we PATCH Noida. Salesforce's Delhi is overwritten and gone.
+  The sweep then reads Salesforce and finds Noida — our own value — and learns
+  nothing. **Delhi is destroyed with no record that it ever existed**, which is
+  precisely the failure this whole exercise is about, and nothing in the
+  system would ever report it.
+- *Sweep first:* we read Delhi with its `SystemModstamp` of 17:00 and feed it
+  in as an observation. The order key compares 17:00 against the portal's
+  15:00, Delhi wins, Noida is recorded as `superseded` with the finance user's
+  name, and condition (d) finds `sf_value` equal to the current value so no
+  repair is owed. The queued row is still there, and when the drain reaches it
+  the sender reads the **current** value (part 6.3) and sends Delhi — a no-op.
+  Both edits are on record and both copies agree.
+
+The window is small and that is the point. With 15,000 portal-touched records
+and 34,900 Salesforce-touched records out of 5 million, the expected overlap is
+`15,000 × 34,900 / 5,000,000` ≈ **105 records**. The ordering rule changes no
+timing and protects about a hundred records in six million edits — and those
+hundred are exactly the ones where an edit would be silently destroyed.
+
+**The sweep runs in full-record mode, and must.** A `SystemModstamp` is a
+*record's* modification time, not a field's, so a record touched at 17:00 hands
+us all nine of its fields stamped 17:00 — including fields last changed months
+ago. Compared as changes, those would beat any portal edit made during the
+outage and overwrite it with Salesforce's stale value. Step (b) of part 5.1 is
+what stops it: a field whose value equals the `sf_value` we already held is a
+restatement, skipped and not restamped. So the rule written for A3's "other
+case" turns out to be **required by outage recovery no matter which payload
+shape the webhook uses**, which is why part 8.4 runs it unconditionally rather
+than only in full-record mode.
+
+The sequence:
+
+```
+1. the breaker's probe succeeds -> the link is back
+2. HOLD the outbound drain
+3. for each object type, page through:
+      SELECT Id, <fields>, SystemModstamp FROM {Type}
+       WHERE SystemModstamp > :watermark ORDER BY SystemModstamp      (A4)
+   feed each record through applyChanges as a full-record observation
+   with occurred_at = its SystemModstamp, origin = salesforce
+4. advance sync_watermark to the highest SystemModstamp fully applied,
+   after each page -> a crash resumes from the page boundary, and a
+   small re-read overlap is harmless because applying an observation
+   twice is a no-op (strict > in part 7.2)
+5. RELEASE the drain, at half rate, ramping (part 6.5)
+```
+
+Two things that are safe without extra machinery. Webhooks are arriving
+normally again during step 3, and both paths go through the same `applyChanges`
+behind the same record lock, so there is no race — a webhook for a record the
+sweep has not reached yet applies normally, and the sweep's later observation
+for it carries an equal-or-older `SystemModstamp` and becomes a no-op. And the
+drain skips what the sweep resolved: a claim-time filter drops any row whose
+field already has `sf_value` equal to the current value, since part 8.3's
+condition says nothing is owed.
+
+### 10.4 The arithmetic
+
+**Inputs,** all from part 1: A1 gives 3 edits/second as the business-hours
+average — not the 20/second peak, because a sustained six-hour peak is not a
+credible event — A2 splits them 70/30, and A12 sets the governor at 70
+requests/second.
+
+```
+outage window            6 h x 3600                       = 21,600 s
+portal edit rate         3 edits/s x 30%                   = 0.9 /s
+Salesforce edit rate     3 edits/s x 70%                   = 2.1 /s
+live traffic on resume   (part 6.5)                        = 7.4 req/s
+drain capacity           70 - 7.4                          = 62.6 req/s
+```
+
+**The outbound backlog:**
+
+```
+queued changes           0.9 /s x 21,600 s                 = 19,440 rows
+distinct records         19,440 / 1.3 changes per record    = 14,954 -> ~15,000 records
+                                                              = 15,000 PATCH calls (one per record, part 6.3)
+
+drain at full rate       15,000 / 62.6 req/s               = 239.6 s = 239.6 / 60 = 4.0 minutes
+```
+
+**Four minutes is the headline, but it is not the honest number**, because the
+breaker resumes at half rate and ramps +5 every 30 seconds (part 6.5). Counting
+the ramp:
+
+```
+rate during each 30 s step   35   40   45   50   55   60   65   then 70
+minus live 7.4            = 27.6 32.6 37.6 42.6 47.6 52.6 57.6       62.6
+calls in that step (x30)  =  828  978 1128 1278 1428 1578 1728
+cumulative after 210 s    = 828+978+1128+1278+1428+1578+1728       = 8,946 calls
+remaining                 = 15,000 - 8,946                          = 6,054 calls
+at full capacity          = 6,054 / 62.6                            = 96.7 s
+total                     = 210 + 96.7                              = 306.7 s = 5.1 minutes
+```
+
+**The inbound sweep,** which runs first and is much cheaper than it looks:
+
+```
+Salesforce changes        2.1 /s x 21,600 s                 = 45,360
+distinct records          45,360 / 1.3                       = 34,892 -> ~34,900 records
+SOQL pages               34,900 / 2,000 records per request  = 17.45 -> 18 requests
+API budget for those     18 / 62.6 req/s                     = 0.29 s          (negligible)
+local apply              34,900 / 500 records per second     = 69.8 s = 1.2 minutes
+```
+
+The asymmetry is worth noticing: **one request reads 2,000 records and one
+request writes 1.** That is why recovery is dominated by the outbound drain and
+why the inbound side of a 6-hour blackout is essentially free in API terms. Its
+cost is 1.2 minutes of local database work.
+
+**Total, end to end:**
+
+```
+inbound sweep (blocking, 10.3)                              = 1.2 minutes
+outbound drain with the ramp                                = 5.1 minutes
+                                                              -----------
+                                                              6.3 minutes
+```
+
+**Call it under 10 minutes** operationally, the margin covering page-fetch
+latency, retries, and the breaker needing a few probes to close.
+
+### 10.5 The pessimistic bound
+
+If the six hours somehow ran at A1's full 20 edits/second peak:
+
+```
+queued changes           6 /s x 21,600 s                   = 129,600 rows
+distinct records         129,600 / 1.3                      = 99,692 -> ~99,700 calls
+after the ramp's 8,946   (99,700 - 8,946) / 62.6 + 210 s    = 1,660 s = 27.7 minutes
+```
+
+**About 28 minutes,** and the useful thing is what it is bounded by: at the
+full 100 requests/second with no reserve at all it is `99,700 / 100 = 997 s =
+16.6 minutes`. So in the worst credible case the **rate cap is the floor**, our
+30% reserve costs about 11 minutes of catch-up, and no change to our design
+beats 17 minutes. That is the trade I would put in front of the client — a
+higher run rate buys catch-up speed and spends the safety margin of A12.
+
+### 10.6 If assumption A4 is false
+
+If there is no changed-since query, Salesforce's edits during the blackout
+cannot be recovered selectively, and the fallback is to compare every record:
+
+```
+all records              5,000,000 / 2,000 per request      = 2,500 requests
+API budget               2,500 / 62.6 req/s                 = 39.9 s
+local merge              5,000,000 / 5,000 per second (batched) = 1,000 s = 16.7 minutes
+```
+
+**About 20 minutes for a full compare of 5 million records** — which is a
+relief rather than a problem, and it changes the answer to A4 from
+load-bearing to merely preferable. Two consequences I would adopt regardless:
+the full compare becomes the recovery procedure instead of the incremental
+sweep, and it is cheap enough to **run nightly as a standing safety net**,
+which would catch any divergence from a lost webhook, a canonicalisation gap,
+or a field the breaker of part 9.5 gave up on. Having costed it, I would want
+that nightly sweep even with A4 confirmed.

@@ -12,7 +12,7 @@ field's history kept.
 | `docs/design.md` | **The design document. Start here.** The exercise's 12-part outline, assumptions first, with four appendices: A the brief's scenario traced, B the hardest race, C interfaces/schema/sequences, D assumption consequences and rejected alternatives. |
 | `CONTEXT.md` | Glossary. The project's domain vocabulary, fixed before the design leans on it. |
 | `docs/adr/` | Decision records for the three choices that are expensive to reverse. |
-| `src/`, `package.json` | Optional demo code (Phase 2). TypeScript on Node 20+, fake Salesforce, no external services. |
+| `src/`, `package.json` | The optional demo. TypeScript on Node 20+, a fake Salesforce, no external services. |
 
 ## Reading order
 
@@ -27,7 +27,24 @@ field's history kept.
 
 ## Running the demo
 
-Phase 2. Not yet present.
+```bash
+npm install
+npm run demo     # the six scenarios, with printed output
+npm test         # the unit tests at the rule seams
+```
+
+Node 20 or newer. No network, no services, no credentials — a fake Salesforce
+written for this repository stands in for the real one, and a JSON document on
+disk stands in for Postgres. `docs/design.md` appendix E lists every
+substitution and says which guarantees are real and which are imitated.
+
+The demo runs six scenarios. Four are the checks the exercise names — a
+duplicate webhook, an older event arriving after a newer one, our own update
+coming back as a webhook and not being sent again, and a pending call still
+present after a `SIGKILL` while the fake Salesforce is down — plus the brief's
+own phone-and-city acceptance scenario and the rate cap. Each names the design
+section it exercises, and a failed check exits non-zero rather than printing
+"FAIL" and carrying on.
 
 ## Commit history
 

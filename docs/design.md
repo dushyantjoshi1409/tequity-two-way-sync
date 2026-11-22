@@ -1416,3 +1416,36 @@ otherwise re-propose.
 | **Alerting on outbound queue depth** rather than age | During catch-up the depth is *supposed* to be 19,000, so a depth alarm fires exactly when the system is working correctly — which is how alarms get muted. |
 | **Recording echoes in `field_change`** with the real history | An echo is not an edit by a person. It would inflate permanent history about 30% with non-history and, because the two have different retentions, make partition-level pruning impossible. |
 | **A per-field ownership table** (finance owns some fields, sales others) | That is open question 6. Building it before the answer would be a guess, and if the answer is yes, part 7 gets *simpler* for those fields rather than harder. |
+
+---
+
+## Appendix E: what the demo substitutes for
+
+The optional code in `src/` implements the rules above and runs on Node alone,
+so three things the design assumes are stood in for. Each substitution is also
+documented at the point it is made — `src/store/store.ts` carries this table in
+its own module docstring — because a reviewer checking code against design
+needs to know which guarantees are real and which are imitated.
+
+| The design assumes | The demo uses | Faithful? |
+| --- | --- | --- |
+| **Postgres tables** | one JSON document on disk, keyed objects and arrays | yes |
+| **`BEGIN` / `COMMIT`** | mutate a deep clone, then write the file atomically; a throw discards the clone | **yes**, for one process — which is what part 5 needs, since the duplicate claim and the apply must commit together |
+| **durability across a restart** | `writeFileSync` to a temp path, then `renameSync`, which is atomic on POSIX | **yes** — the demo SIGKILLs a child process and the queued call is still there |
+| **`SELECT … FOR UPDATE`** (the per-record lock) | nothing: one process, one transaction at a time | **imitated.** The demo cannot show that the lock serialises competing merges, because it has no concurrency |
+| **`FOR UPDATE SKIP LOCKED`** | the `leaseOwner` / `leaseUntilMs` columns the design already carries | **yes** — the lease, and its reclaim after a sender dies, are real |
+| **the partial unique index** (one pending row per field) | an explicit check in the enqueue path | imitated |
+| **`LISTEN` / `NOTIFY`** | the demo calls the worker directly | imitated |
+| **monthly partitions and pruning** | not implemented | absent — retention is a design concern, not a rule |
+| **the live Salesforce record API** | a fake written for this repository, file-backed so it survives the restart, with levers for the four behaviours the rules depend on: it echoes every write, it can be unreachable, it can answer 429, and it can refuse a record's data | the second adapter at the seam (part 2) |
+| **HTTPS to the webhook endpoint** | the handler is called in-process, with the signature still verified over the raw body | imitated — the rules live in the handler, not in the HTTP framing |
+| **70 req/s** (part 6.4) | a deliberately low cap so the wait is visible, which the exercise permits. **The code enforces whatever cap it is given** | the enforcement is real, the number is not the design's |
+| **a 30-second lease** (part 6.5) | a shorter one, for the same reason | as above |
+
+Two of these are worth stating as limits rather than details. The demo **does
+not** show the record-level lock doing its job, because proving that needs
+concurrency it does not have; the lock is in the code and its contract is in
+part 2, but the evidence here is the rules and the ordering, not the locking.
+And the demo's echo fence is per **event** rather than per field, because
+`applyChanges` takes one classification — strictly more conservative than the
+design, since it can never mistake a real change for an echo.

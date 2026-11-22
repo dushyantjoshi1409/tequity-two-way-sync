@@ -386,9 +386,10 @@ applyChanges(input: {
 
 One function, called from two places, carrying everything in parts 7 to 9
 behind it. Callers must know three things and no more: it must be called
-inside a transaction the caller owns; it takes row locks per field in a fixed
-field order, so concurrent calls on one record serialise rather than deadlock;
-and it is idempotent in the strict sense that calling it twice with the same
+inside a transaction the caller owns; it takes **one lock per record** — the
+`record_link` row — so every concurrent merge on one record serialises, in
+either direction, with no lock ordering for a caller to get right; and it is
+idempotent in the strict sense that calling it twice with the same
 `originEventId` and `occurredAt` changes nothing the second time.
 
 **(iv) The seam at Salesforce itself.** `SalesforceClient` is the only module
@@ -779,3 +780,137 @@ makes history a requirement and I would rather not have to argue about it
 later. The 30-day window on `inbound_event` is worth noting for the same
 reason: duplicate suppression costs 104 MB, so there is no reason to trim the
 window to anything that a Salesforce retry could plausibly outlive.
+
+---
+
+## 5. The inbound path: webhook to our database
+
+One HTTP request becomes one Postgres transaction. There is no queue and no
+background step: by the time we answer Salesforce, the change is committed or
+it has not happened at all. Part 2.4 gives the reason and the number at which
+I would revisit it.
+
+### 5.1 The whole path
+
+```
+POST /sync/salesforce/webhook
+  |
+  |-- 1. read the raw body as bytes (the signature covers bytes, not re-serialised JSON)
+  |-- 2. verify X-Signature                              -> 401, no retry   (S7, A7)
+  |-- 3. validate the shape                              -> 400, no retry
+  |         missing eventId / unknown objectType / unknown field /
+  |         unparseable occurredAt / empty changedFields
+  |         Each is a distinct message. A 400 means "this will never work",
+  |         so we must be sure before sending one.
+  v
+BEGIN                                                    -- one transaction, no network calls inside
+  |
+  |-- 4. claim the event                                                    (part 8.1)
+  |      INSERT INTO inbound_event (...) VALUES (...)
+  |        ON CONFLICT (event_id) DO NOTHING RETURNING event_id;
+  |      no row returned -> duplicate -> COMMIT, 200 {"status":"duplicate"}
+  |
+  |-- 5. resolve and lock the record                                        (part 5.2)
+  |      SELECT portal_id FROM record_link
+  |        WHERE object_type = $1 AND sf_id = $2 FOR UPDATE;
+  |      This single lock serialises every merge on this record, inbound and
+  |      portal-side alike. It is the only lock the merge takes.
+  |
+  |-- 6. classify the whole event as echo or not                            (part 9)
+  |      changedBy = integration user?  -> echo
+  |
+  |-- 7. for each field in changedFields:
+  |        canonicalise the value                                           (part 7.2)
+  |        if echo:
+  |            sync_observation('echo'); field_version.sf_value = value
+  |        else if order_key(incoming) > order_key(stored):                 (part 7.1)
+  |            UPDATE customer/contact SET <field> = value
+  |            UPSERT field_version with the new stamp, sf_value = value
+  |            INSERT field_change(outcome='applied', old_value, new_value)
+  |            -- no outbound row: this change came FROM Salesforce
+  |        else if value <> current value:
+  |            INSERT field_change(outcome='superseded')                    (part 8.2)
+  |            field_version.sf_value = value
+  |            INSERT outbound_change(reason='repair')  -- Salesforce is wrong (part 8.3)
+  |        else:
+  |            sync_observation('confirmed'); field_version.sf_value = value
+  |
+  |-- 8. UPDATE inbound_event SET outcome = <applied|echo|superseded|partial>
+  v
+COMMIT
+  |
+  '-- 200 {"status": ...}      <- sent only after the commit returns
+```
+
+Four properties of this shape are deliberate:
+
+- **The dedup claim and the apply are in one transaction.** If they were not,
+  a crash between them would mark an event processed that we never applied,
+  and Salesforce would never send it again (A7 only promises redelivery while
+  we have not answered 200). This is the single most important line in the
+  path.
+- **No network call happens inside the transaction.** Nothing in here can
+  block on Salesforce, which is what keeps the endpoint's p99 at 200 ms and
+  keeps a Salesforce outage from turning into held Postgres locks.
+- **A field is processed independently of its neighbours.** One field in an
+  event can be applied while another in the same event is superseded; the
+  event's recorded outcome is then `partial`. Treating the event as the unit
+  would mean one stale field dragging a fresh one down with it.
+- **The 200 is sent after the commit, never before.** We never answer "accepted,
+  will process shortly", because that turns the 200 into a promise we have no
+  durable record of having made.
+
+### 5.2 Resolving the record, including the creates
+
+Step 5 has three cases. The third is the subtle one.
+
+**(a) Known `sf_id`.** Normal path: one indexed lookup, lock, proceed.
+
+**(b) Unknown `sf_id`, and `changedBy` is a human.** A record created in
+Salesforce that we have not seen — either a genuine new create, or one whose
+create webhook we lost. Mint a `portal_id`, insert the `record_link` and an
+empty typed row, and let step 7 apply every field in the payload as a normal
+first write. This is also exactly what outage recovery does for every record
+it finds (part 10.3), so the create path and the recovery path are the same
+code.
+
+**(c) Unknown `sf_id`, and `changedBy` is the integration user (A6).** This is
+the echo of a create *we* made, arriving before we had recorded the Salesforce
+id it returned. The window is real: we send the upsert keyed on our own
+`portal_id` (A5), Salesforce creates the record and emits the webhook, and the
+webhook can beat our own write of `record_link.sf_id`. If we treated this as
+case (b) we would mint a second local record for one real contact.
+
+The rule: **answer `503` with `Retry-After: 5` and apply nothing.** We are
+asking Salesforce to tell us again in a moment, by which time the link exists
+and the event takes case (a) and is then recognised as an echo. This costs one
+redelivery and reuses the retry behaviour of A7 rather than adding a holding
+table or making a Salesforce call inside the transaction. It is bounded: after
+60 seconds of a record staying unresolvable this way we log it loudly, treat it
+as case (b), and let the unique index on `record_link(object_type, sf_id)`
+plus a reconciliation sweep catch the duplicate — a visible, repairable
+outcome rather than a stall.
+
+Narrowing the rule to `changedBy = integration user` matters. The broader
+version — defer whenever a create is in flight — would delay legitimate
+Salesforce-side creates by 5 seconds whenever any create of ours was
+outstanding, which at A1's rate is most of the time, and would spend the
+latency budget to fix a race that only involves our own writes. If A6 turns out
+to be false, this rule is not available and the fallback is the reconciliation
+sweep alone.
+
+### 5.3 What the status codes commit us to
+
+| We return | Salesforce should | Because |
+| --- | --- | --- |
+| `200` | never send this event again | it is committed; a redelivery is harmless but wasted (part 8.1) |
+| `400` | never send this event again | the payload is wrong in a way time will not fix; it is alerted on our side |
+| `401` | stop and alert a human | our shared secret or theirs is wrong; retrying cannot help |
+| `503` + `Retry-After` | send it again shortly | case (c) above, or we are shedding load |
+| `500` | send it again with backoff | we failed unexpectedly; the retry is safe because of step 4 |
+
+The asymmetry between 400 and 500 is the one to get right. A 400 throws the
+event away forever, so it is only for payloads that are definitely malformed —
+an unknown field name is a 400, but an unexpected *value* in a known field is
+not, because a value we cannot canonicalise is our bug and deserves a 500 and
+a retry.

@@ -1851,3 +1851,100 @@ sweep, and it is cheap enough to **run nightly as a standing safety net**,
 which would catch any divergence from a lost webhook, a canonicalisation gap,
 or a field the breaker of part 9.5 gave up on. Having costed it, I would want
 that nightly sweep even with A4 confirmed.
+
+---
+
+## 11. Three numbers I would watch, and when I would call someone
+
+Three, chosen so that each covers a different way this system fails: **outbound
+is stuck**, **inbound is slow**, and **we are getting it wrong**. The third is
+the only one that detects incorrectness rather than slowness, and it is the one
+I would be most reluctant to give up.
+
+### Number 1 — the age of the oldest unsent change
+
+```sql
+SELECT EXTRACT(epoch FROM clock_timestamp() - MIN(created_at))
+  FROM outbound_change WHERE state = 'pending';
+```
+
+| | |
+| --- | --- |
+| **Normal** | under 5 seconds |
+| **Warn** | 60 seconds |
+| **Call someone** | **300 seconds (5 minutes)** |
+
+Why age and not depth: depth is meaningless on its own, because 19,000 rows
+draining fast is healthy and 3 rows stuck is not. Age answers the question
+that matters — is anything actually waiting?
+
+Five minutes is ten times the 30-second commitment, which is long enough that
+no ordinary burst, retry or ramp reaches it, and short enough to leave most of
+the drain window. The page means one of three things and the first action is to
+tell them apart: the sender lost its leader lease and nothing is sending, the
+circuit breaker is open because Salesforce is unreachable, or a poison record
+at the head of the queue is being retried forever.
+
+### Number 2 — how far behind the inbound path is
+
+```sql
+-- p99 over the last 5 minutes of applied_at - occurred_at, for Salesforce-origin rows
+```
+
+| | |
+| --- | --- |
+| **Normal** | under 6 seconds (part 2.4's budget) |
+| **Warn** | 20 seconds |
+| **Call someone** | **above 30 seconds, sustained for 5 minutes** |
+
+This measures the whole path including Salesforce's own emission delay, which
+is deliberate: the 30 seconds we promised the client is end to end, and a
+number that excluded the part we do not control would be a number that stays
+green while we miss the commitment.
+
+The five-minute qualifier matters. A single slow event is noise. Sustained
+breach is either a genuine Salesforce emission problem — in which case the page
+produces a conversation with the client about A13 rather than a code change —
+or our endpoint is saturated, which part 2.4 says we should answer with an
+inbound queue.
+
+### Number 3 — the divergence rate
+
+```sql
+-- per minute, summed:
+--   outbound_change rows with reason = 'repair'
+-- + field_change rows with outcome = 'superseded' AND origin = 'salesforce'
+```
+
+| | |
+| --- | --- |
+| **Normal** | near zero — part 7.5 estimates one or two genuine races a day |
+| **Warn** | 10 per minute |
+| **Call someone** | **100 per minute**, or any sustained one-directional bias |
+
+This is the number that catches being *wrong* rather than being slow, and
+nothing else in the system would report any of what it catches: a clock skew
+beyond A10, a canonicalisation gap that is making echoes look like changes, a
+loop rule that has stopped working, or a Salesforce-side process overwriting
+portal edits in bulk.
+
+The second threshold is the subtler one. Divergence should be symmetric —
+genuine races go both ways. A *sustained one-directional* bias at any volume is
+the signature of a systematic problem, and I would want to be called for it
+even at 3 per minute, because it is exactly what A10 failing looks like and it
+would otherwise sit under the warn line indefinitely.
+
+### On the dashboard, but not among the three
+
+Each of these is a leading indicator of one of the three above, which is why it
+does not earn a page of its own: the current governor rate and the count of 429
+responses (leading into number 1), the circuit breaker's state and consecutive
+failure count (number 1), the count of rows in `failed` and of fields the
+repair breaker has marked contested (number 3), webhook signature failures and
+400 responses (a leading indicator of a Salesforce-side change to the payload),
+and the lag of `sync_watermark` behind now (whether the nightly sweep of part
+10.6 is keeping up).
+
+One deliberate omission: there is no alert on queue *depth*. During catch-up
+the depth is supposed to be 19,000, and an alert that fires every time the
+system does its job correctly is an alert people learn to close.

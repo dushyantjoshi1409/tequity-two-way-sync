@@ -663,10 +663,11 @@ CREATE TABLE field_version (
   -- who and where, kept for display without reading history
   origin           text    NOT NULL,
   actor            text    NOT NULL,
-  -- what we believe Salesforce currently holds for this field, and the time of
-  -- the newest Salesforce-origin observation that told us so. This pair is the
-  -- whole basis of the repair rule (part 8.3) and of full-record mode (8.4).
-  -- Null until Salesforce has mentioned the field.
+  -- what we believe Salesforce currently holds for this field, and when we
+  -- last learned it. Updated by a Salesforce observation AND by our own
+  -- successful send (part 6.4) -- a write of ours is the most recent thing we
+  -- know about Salesforce's state. This pair is the whole basis of the repair
+  -- rule (8.3) and the restatement rule (8.4). Null until either happens.
   sf_value         text,
   sf_observed_at   timestamptz(3),
   PRIMARY KEY (object_type, portal_id, field)
@@ -781,6 +782,8 @@ CREATE INDEX ON outbound_change (state, next_attempt_at)
 CREATE INDEX ON outbound_change (object_type, portal_id) WHERE state = 'pending';
 CREATE INDEX ON outbound_change (object_type, portal_id, field, created_at)
   WHERE reason = 'repair';                    -- the repair breaker's count (part 9.5)
+CREATE UNIQUE INDEX ON outbound_change (object_type, portal_id, field)
+  WHERE state = 'pending';                    -- at most one pending call per field
 ```
 
 Note what `outbound_change` does **not** store: the value to send. The sender
@@ -1114,9 +1117,22 @@ so every call we make is built to be repeatable. That is why A5 is worth
 pushing for: without an external-id upsert, create is the one operation whose
 repeat is not safe, and the fallback (search, then create) is racy.
 
-On a `2xx` the sender writes the `echo_fence` rows for the fields it sent, then
-marks the group `sent`. The fence is written **after** the response, because a
-fence for a call that never landed would suppress a real Salesforce change.
+On a `2xx` the sender does three things, in this order, then marks the group
+`sent`:
+
+1. sets `sf_value` to the value it sent and `sf_observed_at` to the time of the
+   response, because **our own successful write is the most recent thing we
+   know about Salesforce's state** — more recent than any webhook describing an
+   edit that happened before it;
+2. writes the `echo_fence` rows for the fields it sent;
+3. records `sent_at`.
+
+All three happen **after** the response, never before: a fence or an `sf_value`
+for a call that did not land would suppress a real Salesforce change.
+
+Step 1 is not bookkeeping. Appendix B traces the race it exists for, in which
+leaving `sf_value` untouched on send leaves the two copies permanently
+different with nothing in the system reporting it.
 
 ### 6.5 The rate cap, and slowing down without losing work
 
@@ -1195,7 +1211,7 @@ seconds of delay on the affected rows.
 
 | Outcome | State | Attempts | Then |
 | --- | --- | --- | --- |
-| `2xx` | `sent` | — | write `echo_fence` rows; record `sent_at` |
+| `2xx` | `sent` | — | set `sf_value` / `sf_observed_at` to what we sent; write `echo_fence` rows; record `sent_at` |
 | `429` / limit exceeded | `pending` | restored | halve the rate; honour `Retry-After` |
 | timeout, connection error, `5xx` | `pending` | restored | count toward the breaker; backoff with jitter |
 | `400`-class, data rejected | `failed` | kept | **alert.** A value the portal accepts and Salesforce refuses is a schema disagreement a human must settle |
@@ -1618,20 +1634,26 @@ That dependency is why canonicalisation sits in part 7 as a rule rather than in
 an appendix as a utility, and why L4 below exists for when canonicalisation is
 incomplete.
 
-### 9.3 L2 — the actor rule, which makes the common case free
+### 9.3 L2 — the actor rule, which is load-bearing, not economy
 
 > **A webhook whose `changedBy` is the integration user (A6) is classified as
 > an echo: recorded in `sync_observation`, and never compared or applied.**
 
-This is one string comparison per event and it catches essentially every echo,
-because every call we make is made as that one Salesforce login and nothing
-else uses it. What it buys is not correctness — L1 already has that — but
-cleanliness: echoes never enter the comparison, never produce a `field_change`
-row, and never briefly look like changes. It also closes the ambiguity in part
-5.2 case (c), where recognising our own create's echo is what stops us minting
-a duplicate local record.
+I originally had this down as a tidiness measure on the grounds that L1 already
+guaranteed termination. Appendix B's race shows that is wrong, and the
+distinction matters: **L1 guarantees the loop stops; L2 guarantees it stops on
+the right value.**
 
-If A6 is false, L2 switches off and nothing about termination changes.
+The echo of a write of ours carries an `occurredAt` from the moment Salesforce
+stored it, which is *later* than the edit that prompted it and can be later
+than a genuine edit made on the other side in between. Compared as a change it
+would win, and our own write would have laundered the value we sent back over a
+newer edit from someone else. Classifying by actor **before** any comparison is
+what prevents that; L3 is the same guarantee by a different key for when A6 is
+false.
+
+It also closes part 5.2 case (c), where recognising our own create's echo is
+what stops us minting a duplicate local record.
 
 ### 9.4 L3 — the fence, which saves wasted calls rather than preventing loops
 
@@ -2183,3 +2205,93 @@ record rather than discarded.
 **Seven events, one outbound call.** The duplicate cost nothing, the echo cost
 nothing, the late event cost nothing, and the only request we spent against the
 rate cap was the one that carried real news to Salesforce.
+
+---
+
+## Appendix B: the overwrite race, traced
+
+The race the captain asked to see. It is the hardest case in this design and
+tracing it found a bug, so it gets its own appendix.
+
+**Setup.** `phone` currently `+919000000000` (OLD), last observed from
+Salesforce at 09:00:00. F = `+919000000111` (finance), S = `+919000000222`
+(sales).
+
+| # | Time | What happens |
+| --- | --- | --- |
+| 1 | 10:00:00.000 *(our clock)* | finance saves `phone = F` in the portal |
+| 2 | 10:00:01.000 *(SF clock)* | sales sets `phone = S` in Salesforce |
+| 3 | 10:00:05.000 | our call lands, writing **F** over S in Salesforce |
+| 4 | 10:00:06.000 | the webhook for step 2 finally arrives |
+| 5 | 10:00:07.000 | the echo of our step-3 write arrives |
+
+**Step 1 — the portal save.**
+```
+order key (10:00:00.000, rank 0, pc_1) > (09:00:00, 1, evt_prev)   -> APPLIED
+current := F ;  field_change += (OLD -> F, finance.user, applied)
+(d) sf_value OLD <> current F                                      -> 1 outbound row
+```
+
+**Step 3 — our call lands.** The sender reads the current value at send time
+(6.3) and sends F. Salesforce now holds F: **the sales edit has been
+overwritten in Salesforce.** On the 2xx (6.4):
+```
+sf_value := F ,  sf_observed_at := 10:00:05.000
+echo_fence(phone, hash(F))
+```
+
+**Step 4 — the sales webhook arrives**, `occurredAt 10:00:01.000`,
+`changedBy sales.user`.
+```
+L2  not the integration user                                        -> not an echo
+(a) 10:00:01.000 > sf_observed_at 10:00:05.000 ?  NO
+    -> sf_value STAYS F. Our 10:00:05 write is later than the edit
+       this webhook describes, so it is still the freshest thing we
+       know about Salesforce's state.
+(b) S <> sf_value F                                                 -> a real change
+(c) (10:00:01.000, 1, evt_S) > (10:00:00.000, 0, pc_1)              -> APPLIED
+    current := S ;  field_change += (F -> S, sales.user, 10:00:01, applied)
+(d) sf_value F <> current S                                         -> REPAIR queued
+```
+
+**Step 5 — the echo of our own write arrives**, `occurredAt ~10:00:05.000`,
+value F, `changedBy integration.user`.
+```
+L2  -> ECHO. sync_observation('echo'). Step (c) never runs.
+(d) sf_value F <> current S -> a repair is already pending for this field;
+    the partial unique index on outbound_change keeps it at one row.
+```
+
+**Step 6 — the repair sends.** Reads the current value, sends **S**. Salesforce
+holds S. `sf_value := S`. Its own echo then makes `sf_value` equal the current
+value and condition (d) goes false. Settled.
+
+### The result
+
+```
+portal:      phone = S  (sales, 10:00:01)
+Salesforce:  phone = S
+history:     OLD -> F  finance.user  10:00:00  applied
+             F   -> S  sales.user    10:00:01  applied
+```
+
+**Both copies end on the sales value**, and the finance edit is on record with
+its author rather than being silently discarded.
+
+### Why the echo cannot win on its later `occurredAt`
+
+Because it is classified as an echo by `changedBy` **before** any order-key
+comparison happens, so its 10:00:05 stamp is never compared — which is
+load-bearing rather than tidy, since that stamp is later than the sales edit's
+10:00:01 and would otherwise let our own write launder the value we sent back
+over a newer edit from the other side.
+
+### The bug this trace found
+
+Without step 3's `sf_value := F`, step 4(a) would have seen `10:00:01.000 >
+09:00:00` and set `sf_value := S`. Condition (d) would then have compared S
+against a current value of S, found them equal, and queued **no repair** —
+leaving Salesforce holding F and the portal holding S, permanently, with every
+metric green. The fix is one line in the sender, and the reason it was missing
+is that I had been treating `sf_value` as "what Salesforce told us" when it has
+to mean "what we believe Salesforce holds", and our own writes are part of that.

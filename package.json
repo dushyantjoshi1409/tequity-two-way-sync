@@ -1,0 +1,14 @@
+{
+  "name": "tequity-two-way-sync",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Two-way sync of customer and contact records between Salesforce and a Postgres-backed portal. Demo for the Tequity Round 1 exercise.",
+  "type": "module",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "demo": "npm run build --silent && node dist/demo/main.js",
+    "test": "npm run build --silent && node --test dist/"
+  },
+  "devDependencies": { "typescript": "5.6.3", "@types/node": "20.17.6" }
+}

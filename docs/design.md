@@ -584,16 +584,22 @@ proven.
 A component appears here only because a subproblem above needed it. Four of the
 eight need nothing new, which is the point of ordering the work this way.
 
-| Subproblem | What it adds | What it adds to the running system |
+| Subproblem | What it adds to the running system | Exercised by the demo |
 | --- | --- | --- |
-| S1 | the MERGE module; `field_version`, `field_change`, and the typed `customer` / `contact` tables | the only new module with real depth |
-| S2 | the canonicalisation rule, and `echo_fence` | **no new process.** Loop termination is a property of MERGE, not a component |
-| S3 | `outbound_change`; the SYNC WORKER process; the rate governor; `SalesforceClient` | the second process, and the only seam with two adapters |
-| S4 | `inbound_event`; the WEBHOOK ENDPOINT process | the first process |
-| S5 | `record_link` | **no new process** |
-| S6 | `sync_watermark`, and a sweep that runs inside the existing worker | **no new process** |
-| S7 | signature-verification middleware in the endpoint | **no new process** |
-| S8 | a one-off script | **nothing.** It is not part of the running system |
+| S1 | MERGE, `field_version`, `field_change`, the typed tables — the only new module with real depth | **yes** — the phone-and-city scenario, ending with both values and the full history |
+| S2 | the canonicalisation rule and `echo_fence`. **No new process:** loop termination is a property of MERGE | **yes** — our own update returns as a webhook and is not sent back |
+| S3 | `outbound_change`, the SYNC WORKER, the rate governor, `SalesforceClient` — the second process, and the only seam with two adapters | **yes** — a pending call survives a restart while the fake Salesforce is down, then drains; and the cap is enforced |
+| S4 | `inbound_event`, the WEBHOOK ENDPOINT — the first process | **yes** — a duplicate webhook, and an older event arriving after a newer one |
+| S5 | `record_link`. **No new process** | no |
+| S6 | `sync_watermark`, a sweep inside the existing worker. **No new process** | no |
+| S7 | signature middleware in the endpoint. **No new process** | no |
+| S8 | a one-off script. **Nothing** — not part of the running system | no |
+
+The demo exercises **S1 to S4 and nothing below them**, which is deliberate
+rather than convenient: those are exactly the four the risk ordering in 3.1 put
+first, and they are the four whose failures are either unrecoverable or silent.
+S5 to S8 fail visibly and are repairable by re-running something, so a passing
+demo would say less about them.
 
 What I am deliberately *not* adding, each tied to the subproblem that would
 have to exist first to justify it:

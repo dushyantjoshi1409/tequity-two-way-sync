@@ -1583,157 +1583,76 @@ the webhook is built.
 
 ## 9. The rule that stops a loop
 
-### 9.1 Why this one gets four layers
+Ranked second of eight in part 3: every other failure damages the records it
+touches, while a loop consumes the whole 100 requests/second budget and stops
+sync for every record at once, within seconds of deployment.
 
-Part 3 ranked loop termination second of eight subproblems, above the durable
-queue, and the reason bears repeating here. Every other failure in this design
-damages the records it touches. A loop consumes the whole 100 requests/second
-budget, which stops sync for **every** record and every user at once, and it
-reaches that state within seconds of being deployed. It is also the failure
-most likely to be invisible in testing, because a loop needs a real
-Salesforce's real echo behaviour to appear at all.
+### 9.2 L1 — the structural rule, and the termination guarantee
 
-So the rule is layered: **one layer is the guarantee, and the other three exist
-to keep the guarantee cheap.** Being clear about which is which is the point —
-a design where four mechanisms all sort of help is a design where nobody knows
-what happens when one is removed.
+> **Outbound work is created exactly when `field_version.sf_value` differs from
+> a field's current value — condition (d) of part 5.1, after every field, on
+> both paths, and nowhere else.**
 
-### 9.2 L1 — the structural rule, and the only one that guarantees termination
+*We call Salesforce when, and only when, we believe Salesforce disagrees with
+us.*
 
-> **Outbound work is created exactly when `field_version.sf_value` is distinct
-> from a field's current value — condition (d) of part 5.1, checked after every
-> field, on both paths, and nowhere else. Nothing else enqueues anything,
-> ever.**
+```
+portal sets city = Noida   -> sf_value "Gurugram" <> "Noida"  -> 1 outbound row
+we PATCH Noida, 2xx        -> sf_value := "Noida"             (6.4)
+Salesforce echoes Noida    -> sf_value "Noida" = current      -> 0 rows.  Dead.
+```
 
-That single condition is the whole rule. It is not a check anybody has to
-remember to perform at the right moment; it is the one place in the design
-where outbound work comes from, and it says something simple: *we call
-Salesforce when and only when we believe Salesforce disagrees with us.*
-
-An echo tells us Salesforce now holds the value we just sent, which makes
-`sf_value` equal to the current value, which makes the condition false. **A
-loop has no fuel after one hop** — not because a rule caught it, but because
+The loop has no fuel after one hop — not because a rule caught it, but because
 there is nothing left to disagree about.
 
-Trace it with the exercise's own requirement — an update we send must not
-bounce back and forth forever:
+**Precondition: canonical form (7.3).** Two spellings of one value would make
+an echo look like a change, which is the only way to give the loop fuel. If
+Salesforce reformats a phone we sent and we compare raw strings, the sync
+becomes a generator of its own traffic.
 
-```
-portal sets city = Noida          -> current value moves  -> 1 outbound row
-we PATCH Salesforce with Noida    -> Salesforce stores Noida
-Salesforce emits a webhook: city = Noida
-  step (a) sf_value := Noida
-  step (c) no current value moves (it is already Noida)
-  step (d) sf_value Noida = current Noida  -> no repair
-  => 0 outbound rows.  The loop is dead here, by construction.
-```
+### 9.3 L2 — the actor rule
 
-Note that L1 covers the repair write too, which is the part a reader should
-check, since a repair is outbound work created by an *inbound* event. The
-repair sends our current value; Salesforce stores it and echoes it; the echo
-sets `sf_value` to that same value; condition (d) is then false. One repair,
-one echo, terminated.
+> A webhook whose `changedBy` is the integration user (A6) is an echo:
+> recorded, never compared, never applied.
 
-**L1 depends on canonical form** (part 7.3). Two spellings of one value would
-make an echo look like a change, which is the one way to give the loop fuel.
-That dependency is why canonicalisation sits in part 7 as a rule rather than in
-an appendix as a utility, and why L4 below exists for when canonicalisation is
-incomplete.
+**Load-bearing, not economy.** L1 guarantees the loop stops; L2 guarantees it
+stops on the right value. The echo of our own write carries the time Salesforce
+stored it, which is later than the edit that write overwrote, so compared as a
+change it would win and launder our value back over a newer edit from the other
+side — Appendix B traces exactly that. It also closes part 5.2 case (c).
 
-### 9.3 L2 — the actor rule, which is load-bearing, not economy
+### 9.4 L3 — the echo fence
 
-> **A webhook whose `changedBy` is the integration user (A6) is classified as
-> an echo: recorded in `sync_observation`, and never compared or applied.**
+> After a 2xx, the sender records the record, field and hash of the canonical
+> value sent, expiring in 15 minutes; an inbound change matching an unexpired
+> entry is an echo.
 
-I originally had this down as a tidiness measure on the grounds that L1 already
-guaranteed termination. Appendix B's race shows that is wrong, and the
-distinction matters: **L1 guarantees the loop stops; L2 guarantees it stops on
-the right value.**
+L2's guarantee keyed on the value we sent rather than on the actor, so it still
+holds if A6 is false; it also suppresses a wasted repair when two of our own
+writes to one field are in flight at once. Safe because the fence is written
+after the response, so it can never exist for a call that did not land, and
+because a genuine Salesforce edit setting the very value we just sent is
+indistinguishable from an echo and treating it as one changes nothing.
 
-The echo of a write of ours carries an `occurredAt` from the moment Salesforce
-stored it, which is *later* than the edit that prompted it and can be later
-than a genuine edit made on the other side in between. Compared as a change it
-would win, and our own write would have laundered the value we sent back over a
-newer edit from someone else. Classifying by actor **before** any comparison is
-what prevents that; L3 is the same guarantee by a different key for when A6 is
-false.
+### 9.5 L4 — the repair breaker
 
-It also closes part 5.2 case (c), where recognising our own create's echo is
-what stops us minting a duplicate local record.
+> Above **5 repairs to one field in an hour**, enqueue nothing more for it,
+> mark it contested, and alert.
 
-### 9.4 L3 — the fence, which saves wasted calls rather than preventing loops
-
-> **After a successful send, the sender writes an `echo_fence` row keyed on the
-> record, the field, and the hash of the canonical value sent, expiring in 15
-> minutes. An inbound change matching an unexpired fence is classified as an
-> echo, and the fence row is consumed.**
-
-Being precise about what this is for, because it would be easy to present it as
-a third safety net and that would be overselling it. The case it addresses:
-
-```
-portal sets phone = A at T1   -> sent
-portal sets phone = C at T3   -> sent
-the echo of A arrives before the echo of C
-   step (a) sf_value := A      (A's occurredAt is the newest word so far)
-   step (d) sf_value A <> current C  -> a repair write carrying C
-            ...which we have already sent. One wasted call.
-   then C's echo arrives, sf_value := C, and it settles.
-```
-
-Without L3 that costs one unnecessary request. It is **not** a correctness
-problem and it terminates on its own. L3 removes the waste by recognising the
-echo for what it is. It earns its place mainly during catch-up after an outage,
-when many echoes and many queued changes interleave and a per-field wasted call
-stops being a rounding error.
-
-Two properties make it safe. The fence is written **after** the 2xx, so a fence
-can never exist for a call that did not land and therefore cannot suppress a
-real Salesforce change. And its false positives are harmless by construction: a
-genuine Salesforce edit that happens to set the very value we just sent is
-indistinguishable from an echo, and treating it as one changes nothing, because
-the value is the same either way.
-
-**If I had to ship in a week, L3 is what I would cut.** Saying so is the point
-of ranking the layers.
-
-### 9.5 L4 — the repair breaker, for when canonical form is incomplete
-
-The one way L1 can fail is a value Salesforce stores differently from how we
-sent it, in a way our canonicalisation does not normalise. Then: we send `V`,
-Salesforce stores `V'`, the echo carries `V'`, `sf_value := V'`, condition (d)
-sees `V' ≠ V` and enqueues a repair carrying `V`, Salesforce stores `V'` again,
-and the two systems argue forever at one request per round trip, per field.
-
-I do not want to claim canonicalisation is complete — a picklist the client
-changes, a phone number in a format the parser does not know, a trailing
-character in an address — so the backstop is explicit:
-
-> **Before enqueuing a repair for a field, count the repairs already enqueued
-> for that field in the last hour. Above 5, enqueue nothing, mark the field
-> contested, and alert.**
-
-The count is one indexed read of `outbound_change` on the repair path only,
-which is rare. The behaviour when it trips is deliberately conservative: we
-keep serving our current value to the portal and we **stop arguing with
-Salesforce** about that one field. The two copies are then knowingly different
-for that field, which is strictly better than the alternative of spending the
-rate cap on an argument neither side can win, and a human gets told which field
-and which record so the canonicalisation gap can be closed.
+Bounds the one way L1 fails: a value Salesforce stores in a spelling our
+canonical form does not normalise makes each echo read as disagreement, and the
+two systems argue at one request per round trip forever. When it trips we keep
+serving our value and stop arguing — knowingly different on one field beats
+spending the cap on an argument neither side can win.
 
 ### 9.6 What each layer is worth
 
-| Layer | Guarantees termination? | What its absence costs |
+| | Guarantees | Absent |
 | --- | --- | --- |
-| **L1** structural: we call only when we believe Salesforce disagrees | **yes** | everything. Without it no other layer saves us |
-| L2 actor check | no | echo noise in history; the create race of part 5.2(c) reopens |
-| L3 echo fence | no | occasional wasted requests, worst during catch-up |
-| L4 repair breaker | bounds the one way L1 fails | an unbounded two-system argument over one field |
-
-The honest summary: **L1 is the design, L2 and L3 are economy, and L4 is the
-admission that canonicalisation is a thing humans maintain.**
-
----
+| **L1** + canonical form | the loop **terminates** | everything; no other layer saves us |
+| **L2** | it terminates on the **right value** | our own write launders a stale value over a newer one |
+| L3 | L2's guarantee without A6 | nothing, while A6 holds |
+| L4 | bounds L1's one failure mode | an unbounded argument over one field |
 
 ## 10. The 6-hour outage: what is on disk, how we drain it, the arithmetic
 

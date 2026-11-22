@@ -12,6 +12,56 @@ This document is written for a teammate who was not on the call. Parts 1 and 2
 are the context; parts 7 to 10 are the four rules the exercise asks for; the
 arithmetic is in part 10 and the running totals in part 2.3.
 
+---
+
+## Summary — the whole design on one page
+
+**The one idea.** The unit of sync is a **field**, not a record. Every field
+carries an **order key** — `(occurred_at, origin_rank, origin_event_id)` — and
+the current value is the one whose order key is greatest. `occurred_at` is the
+webhook's `occurredAt` on the Salesforce side and our own database's
+`clock_timestamp()` on a portal save. Everything else follows from that.
+
+**The shape.** Two processes, one repository. A **webhook endpoint** validates
+and applies inbound changes in a single Postgres transaction and answers 200
+only after it commits. A **sync worker** drains a durable queue to Salesforce
+under a rate governor. They never call each other: the seam between them is
+Postgres, which is what lets a value change and the obligation to tell
+Salesforce be the same commit.
+
+**Salesforce does no merging.** It overwrites with whatever lands last, so we
+are the only party comparing anything. That makes our database the holder of
+the decision and gives the design its single most useful rule.
+
+**The one condition.** Outbound work is created exactly when
+`sf_value`— what we believe Salesforce holds for a field — differs from that
+field's current value. Checked after every field, on both paths, nowhere else.
+
+> *We call Salesforce when, and only when, we believe Salesforce disagrees with us.*
+
+**The four rules the exercise asks for**, each a consequence of the above:
+
+| | Rule | Where |
+| --- | --- | --- |
+| **Duplicate webhook** | `eventId` is claimed in the same transaction as the apply. And the order-key comparison is strictly `>`, so a duplicate that escapes the table is a no-op anyway. | 8.1 |
+| **Out of order** | Compare order keys per field. A change that is not strictly newer never becomes current but is kept as `superseded`, with its actor and time. | 8.2 |
+| **Sync loop** | An echo tells us Salesforce holds the value we sent, which makes `sf_value` equal the current value, which makes the one condition false. The loop has no fuel after one hop. | 9.2 |
+| **6-hour outage** | Queue rows are committed with the edit, so they survive a restart. On recovery the inbound sweep runs **before** the outbound drain, or we would overwrite Salesforce edits we had not yet learned about. | 10.3 |
+
+**The numbers.** Assumed peak 20 edits/second, business-hours average 3, quiet
+hour 0.5. We run at **70 of the 100 requests/second** allowed, which steady
+state uses 11% of. A 6-hour outage queues **19,440 changes**, coalescing to
+**15,000 calls**, draining in **5.1 minutes** counting the governor's ramp;
+with the 1.2-minute inbound sweep first, **about 6.3 minutes end to end**. At a
+sustained peak it would be 27.7 minutes, against a floor of 16.6 set by the cap
+itself. The 30-second target closes at about 6 seconds on both paths, of which
+7 of the 9.8 worst-case seconds belong to Salesforce rather than to us.
+
+**The three things I would most want answered:** how the webhook is actually
+produced (Change Data Capture would retire a third of part 8), whether an
+external-id field exists for idempotent creates, and what else in the client's
+Salesforce org is spending the rate limit.
+
 **Contents**
 
 1. [Assumptions, and the questions I would ask](#1-assumptions-and-the-questions-i-would-ask)

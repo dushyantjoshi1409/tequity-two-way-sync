@@ -97,6 +97,8 @@ is 20 million edits a year; spread over 250 working days of 8 hours
 peak-to-average factor of 7, which is ordinary for a business application with
 daily, weekly and month-end peaks, gives 20 edits/second sustained over the
 busiest quarter hour. Part 10 uses these numbers.
+The **outage arithmetic in part 10.4 uses the 3/second average, not the peak**,
+and 10.1 says why.
 *If it goes the other way:* at a real peak of 200 edits/second the portal's
 share alone is 60 requests/second and we are close to the cap in steady state,
 so per-record coalescing stops being an optimisation and becomes load-bearing,
@@ -1668,6 +1670,16 @@ Six hours in which the Salesforce record API is unreachable and webhooks
 Salesforce tried to send may never arrive. Per A16 I design for both directions
 being dark at once, which is the harder reading of the brief and the one its two
 sentences jointly imply.
+
+**The outage arithmetic uses the business-hours average of 3 edits/second, not
+A1's 20/second peak.** Stating that up front because the two give very
+different answers — about 6 minutes against about 35 — and the choice is a
+judgement, not an oversight. A peak is a 15-minute phenomenon: month-end, a
+bulk reassignment, a morning rush. Six consecutive hours of it is not a
+credible event, and sizing the headline answer for one would overstate what the
+client should expect every time. The peak is carried as a named bound instead —
+row 3 of the table in 10.4 — so both numbers are on the page and neither is
+hiding.
 
 **The portal keeps working throughout.** Finance and customer-success staff
 edit records, their edits apply locally, appear immediately in the portal, and

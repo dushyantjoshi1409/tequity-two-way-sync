@@ -120,6 +120,13 @@ export class Tx {
 
   // --------------------------------------------------------- field versions
 
+  /**
+   * The cached order key and Salesforce belief for one field, if any exists.
+   *
+   * Undefined means no change has ever won this field and we have never heard
+   * Salesforce's value for it — which condition 8.3 reads as a disagreement,
+   * not as agreement.
+   */
   getFieldVersion(
     objectType: ObjectType,
     portalId: string,
@@ -275,12 +282,14 @@ export class Tx {
 
   // ------------------------------------------------------- links, watermark
 
+  /** The link for a Salesforce id, or undefined if we have never seen it (design 5 case (b)). */
   findLinkBySfId(objectType: ObjectType, sfId: string): RecordLinkRow | undefined {
     return this.state.recordLinks.find(
       (l) => l.objectType === objectType && l.sfId === sfId,
     );
   }
 
+  /** The link for one of our own ids. Its `sfId` is null until Salesforce assigns one. */
   findLinkByPortalId(objectType: ObjectType, portalId: string): RecordLinkRow | undefined {
     return this.state.recordLinks.find(
       (l) => l.objectType === objectType && l.portalId === portalId,

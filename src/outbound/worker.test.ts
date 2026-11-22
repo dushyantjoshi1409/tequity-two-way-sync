@@ -22,6 +22,7 @@ import {
   SalesforceUnreachable,
 } from "../salesforce/client.js";
 import type { ChangedRecord, SalesforceClient } from "../salesforce/client.js";
+import { FakeSalesforce } from "../salesforce/fake.js";
 import { DurableStore } from "../store/store.js";
 import { RateGovernor } from "./governor.js";
 import { BREAKER_THRESHOLD, SyncWorker } from "./worker.js";
@@ -319,8 +320,12 @@ describe("SyncWorker restart recovery", () => {
 
 describe("SyncWorker: a credential failure stops the sender (design 6.5)", () => {
   test("the work is kept, the attempt is restored, and the sender stops", async () => {
+    // Through the real fake, so the credential path is proved against the
+    // adapter the demo uses rather than only against a stub.
+    const fake = FakeSalesforce.open(join(dir, "salesforce.json"));
+    const worker = new SyncWorker(store, fake, governor, "test-owner", () => Date.now(), 1000);
     seedOwed("portal-1", { city: "Noida" });
-    salesforce.failWith = () => new SalesforceAuthFailed("INVALID_SESSION_ID");
+    fake.failAuth(true);
 
     const report = await worker.runOnce();
 
@@ -379,5 +384,27 @@ describe("SyncWorker: a store failure is not an endpoint failure", () => {
     patched.transaction = realTransaction;
     assert.equal(salesforce.upserts.length, 1, "the send did land");
     assert.equal(worker.isBreakerOpen, false, "a disk problem must not open the breaker");
+  });
+});
+
+describe("SyncWorker: a row Salesforce refuses, through the real fake", () => {
+  test("it is marked failed and alerted, not retried into the cap", async () => {
+    // Uses FakeSalesforce rather than the stub, so the lever the fake
+    // advertises for "it can refuse a record's data" is actually exercised and
+    // the 400-class path is proved end to end against the adapter the demo
+    // uses (design 6.5's `400`-class row).
+    const fake = FakeSalesforce.open(join(dir, "salesforce.json"));
+    const fakeWorker = new SyncWorker(store, fake, governor, "test-owner", () => Date.now(), 1000);
+    seedOwed("portal-1", { city: "Noida" });
+    fake.rejectWritesTo("city");
+
+    const report = await fakeWorker.runOnce();
+
+    assert.equal(report.rowFailures, 1);
+    const rows = store.read((tx) => tx.outboundRows());
+    assert.equal(rows[0]?.state, "failed");
+    assert.match(String(rows[0]?.lastError), /INVALID_FIELD: city/);
+    // Never deleted: the row keeps its error as the record that a human is needed.
+    assert.equal(rows.length, 1);
   });
 });

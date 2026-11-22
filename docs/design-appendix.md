@@ -630,6 +630,13 @@ Two of these are worth stating as limits rather than details. The demo **does
 not** show the record-level lock doing its job, because proving that needs
 concurrency it does not have; the lock is in the code and its contract is in
 part 2, but the evidence here is the rules and the ordering, not the locking.
+The demo's echo fence has one further limit worth naming: a multi-field webhook
+that matches a fence for some of its fields but not all of them is classified as
+a real change, and the fences it did match are consumed on the way. With A6
+holding, L2 settles the question before fences are consulted, so this costs
+nothing; with A6 false it can spend one repair call. L1 still terminates the
+loop, so it is a cost, not a correctness gap.
+
 And the demo's echo fence is per **event** rather than per field, because
 `applyChanges` takes one classification — strictly more conservative than the
 design, since it can never mistake a real change for an echo.

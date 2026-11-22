@@ -365,6 +365,11 @@ export class SyncWorker {
     this.governor.onSuccess();
     this.store.transaction((tx) => {
       const now = this.nowMs();
+      // Only the batch's own rows, even on a create, where the call carried
+      // every field. A field we sent but did not owe keeps its unknown
+      // `sf_value`, which condition 8.3 reads as a disagreement — so the worst
+      // case is one redundant call that confirms what Salesforce already has,
+      // never a missed one. Erring toward an extra call is the safe direction.
       for (const row of batch.rows) {
         const value = plan.values[row.field] ?? null;
         const fv = tx.getFieldVersion(batch.objectType, batch.portalId, row.field);

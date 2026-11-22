@@ -218,6 +218,137 @@ describe("applyChanges: a Salesforce create stamps every field (design 5 case (b
   });
 });
 
+describe("applyChanges: different fields both survive (design 7.4, the brief's scenario)", () => {
+  /**
+   * The exercise's own scenario. Sales creates the contact in Salesforce;
+   * finance corrects the city in the portal; sales then changes the phone in
+   * Salesforce. The portal must end with the new phone **and** the finance
+   * city, each with its own actor and time.
+   *
+   * No conflict rule is needed for this, which is the argument for ADR 0002:
+   * the field, not the record, is the unit that conflicts.
+   */
+  function briefScenario(store: DurableStore): {
+    create: AppliedField[];
+    cityEdit: AppliedField[];
+    phoneEdit: AppliedField[];
+  } {
+    createRecord(store, "Contact", "c-1");
+
+    const create = feed(store, {
+      objectType: "Contact",
+      portalId: "c-1",
+      origin: "salesforce",
+      actor: "sales.user",
+      occurredAtMs: 1_000,
+      originEventId: "evt_1",
+      rawChanges: {
+        full_name: "Asha Mehta",
+        phone: "+91 98765 43210",
+        email: "asha@client.example",
+        city: "Gurugram",
+      },
+    });
+
+    const cityEdit = feed(store, {
+      objectType: "Contact",
+      portalId: "c-1",
+      origin: "portal",
+      actor: "finance.user",
+      occurredAtMs: 2_000,
+      originEventId: "chg_1",
+      rawChanges: { city: "Noida" },
+    });
+
+    // The webhook names `phone` only (assumption A3), so `city` is never even
+    // looked at.
+    const phoneEdit = feed(store, {
+      objectType: "Contact",
+      portalId: "c-1",
+      origin: "salesforce",
+      actor: "sales.user",
+      occurredAtMs: 3_000,
+      originEventId: "evt_2",
+      rawChanges: { phone: "+91 99999 00000" },
+    });
+
+    return { create, cityEdit, phoneEdit };
+  }
+
+  test("the record ends with the new phone and the finance city", () => {
+    withStore((store) => {
+      const { cityEdit, phoneEdit } = briefScenario(store);
+
+      assert.equal(fieldResult(cityEdit, "city").outcome, "applied");
+      assert.equal(fieldResult(phoneEdit, "phone").outcome, "applied");
+      assert.deepEqual(valuesOf(store, "Contact", "c-1"), {
+        full_name: "Asha Mehta",
+        phone: "+919999900000",
+        email: "asha@client.example",
+        city: "Noida",
+      });
+    });
+  });
+
+  test("each field keeps its own actor and time", () => {
+    withStore((store) => {
+      briefScenario(store);
+
+      const history = historyOf(store, "Contact", "c-1");
+      assert.deepEqual(
+        history.map((r) => [r.field, r.outcome, r.newValue, r.actor, r.occurredAtMs]),
+        [
+          ["full_name", "applied", "Asha Mehta", "sales.user", 1_000],
+          ["phone", "applied", "+919876543210", "sales.user", 1_000],
+          ["email", "applied", "asha@client.example", "sales.user", 1_000],
+          ["city", "applied", "Gurugram", "sales.user", 1_000],
+          // The history the client is paying for: the city was changed by
+          // finance at 2000, and the phone by sales at 3000, and the phone
+          // change did not disturb the city.
+          ["city", "applied", "Noida", "finance.user", 2_000],
+          ["phone", "applied", "+919999900000", "sales.user", 3_000],
+        ],
+      );
+    });
+  });
+
+  test("the Salesforce phone edit leaves the city untouched", () => {
+    withStore((store) => {
+      const { phoneEdit } = briefScenario(store);
+
+      // Fields are independent: the third event returns one row, for the one
+      // field it named.
+      assert.deepEqual(
+        phoneEdit.map((r) => r.field),
+        ["phone"],
+      );
+
+      const city = store.read((tx) => tx.getFieldVersion("Contact", "c-1", "city"));
+      assert.ok(city);
+      assert.equal(city.occurredAtMs, 2_000);
+      assert.equal(city.actor, "finance.user");
+      assert.equal(city.origin, "portal");
+      // Still Salesforce's stale copy: our correction has not been sent yet.
+      assert.equal(city.sfValue, "Gurugram");
+    });
+  });
+
+  test("only the city owes Salesforce a call", () => {
+    withStore((store) => {
+      briefScenario(store);
+
+      // The phone change came *from* Salesforce, so Salesforce already agrees
+      // about it; the city is ours and Salesforce does not have it yet.
+      assert.deepEqual(
+        outboundOf(store)
+          .filter((r) => r.state === "pending")
+          .map((r) => [r.field, r.reason]),
+        [["city", "portal-edit"]],
+      );
+    });
+  });
+});
+
 describe("applyChanges: the repair breaker (design 9.4, rule L4)", () => {
   /**
    * Put `repairs` repair rows for one field into the queue, each already sent,

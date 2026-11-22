@@ -16,8 +16,9 @@
  * - **(b) restatement** skips a field whose value equals the `sf_value` we
  *   already held, because a full-record payload restates unchanged fields with
  *   a fresh record-level timestamp (design 8.4).
- * - **(c) decide** compares order keys — and only here can a current value
- *   change.
+ * - **(c) decide** takes the first case that applies — echo, then a value
+ *   equal to the one we already hold, then the order-key comparison — and only
+ *   here can a current value change.
  * - **(d) repair** is one condition, checked after every field whatever
  *   happened to it: if we believe Salesforce disagrees with us, we owe
  *   Salesforce a call (design 8.3, 9.1).
@@ -260,10 +261,17 @@ function applyOneField(
       actor: input.actor,
       outcome: "applied",
     });
-  } else if (value !== currentBefore) {
-    // A real edit by a real person that lost the comparison. Kept with its
-    // value, actor and time, because the brief is explicit that the fact of an
-    // earlier edit stays on record (design 7.5).
+  } else {
+    // A real edit by a real person, to a value we do not hold, that lost the
+    // order-key comparison. Kept with its value, actor and time, because the
+    // brief is explicit that the fact of an earlier edit stays on record
+    // (design 7.5).
+    //
+    // No `value !== currentBefore` guard is needed here: the equality branch
+    // above has already taken every change that matches what we hold, so
+    // everything reaching this branch is a genuine disagreement about the
+    // value — which is also why a `superseded` row always records a real
+    // difference rather than a no-op.
     outcome = "superseded";
     tx.appendFieldChange({
       objectType,
@@ -276,21 +284,6 @@ function applyOneField(
       originEventId: input.originEventId,
       actor: input.actor,
       outcome: "superseded",
-    });
-  } else {
-    // Not newer, and the same value we already hold: nobody edited anything.
-    // An observation, not history — it is not an edit by a person (design 4).
-    outcome = "confirmed";
-    tx.appendObservation({
-      objectType,
-      portalId,
-      field,
-      observedValue: value,
-      occurredAtMs: input.occurredAtMs,
-      origin: input.origin,
-      originEventId: input.originEventId,
-      actor: input.actor,
-      outcome: "confirmed",
     });
   }
 

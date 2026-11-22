@@ -223,7 +223,7 @@ must discard one, unable to see they touched different fields.
 | Table | Holds | Note |
 | --- | --- | --- |
 | `customer`, `contact` | **the current values**, typed, as the portal already wants them | the current value lives **here and nowhere else**; two copies would be two things that can disagree |
-| `field_version` | the **order key** per `(record, field)`, plus `sf_value` / `sf_observed_at` | a **cache, not a second truth** — derivable from the logs below, and a rebuild is the repair for any doubt. Also the row MERGE locks |
+| `field_version` | the **order key** per `(record, field)`, plus `sf_value` / `sf_observed_at` — what we believe Salesforce holds, and when we last learned it. Updated by a Salesforce observation **and by our own successful send** | a **cache, not a second truth** — derivable from the logs below, and a rebuild is the repair for any doubt. Also the row MERGE locks |
 | `field_change` | **the history**: append-only, `applied` and `superseded`, both **permanent** | what the client is buying. `superseded` is kept because the brief says the fact of an earlier edit stays on record |
 | `sync_observation` | `echo` and `confirmed` observations, 90-day partitions | neither is an edit by a person, so neither is history; mixing them in would inflate permanent history ~30% and defeat partition pruning |
 | `inbound_event` | the duplicate key, 30-day retention (104 MB) | 8.1 |
@@ -534,6 +534,14 @@ short buffer is worth reconsidering.
 > **After every field, regardless of what happened to it: if
 > `field_version.sf_value` is distinct from the current value, enqueue a repair
 > write.**
+
+"Distinct from" is SQL's `IS DISTINCT FROM`, and the NULL case is load-bearing
+rather than incidental: **an `sf_value` we have never learned is distinct from
+any current value**, because "we do not know what Salesforce holds" is itself a
+disagreement we owe a call about. That is what sends a portal edit to a field
+Salesforce has never mentioned, and without it every portal-created record
+would be stranded — the condition would be silent exactly when Salesforce knows
+least.
 
 | What happened | `sf_value` after | Current | Repair? |
 | --- | --- | --- | --- |

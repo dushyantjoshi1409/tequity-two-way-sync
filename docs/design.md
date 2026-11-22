@@ -262,6 +262,17 @@ Four properties are deliberate:
   holds before step (c) decides anything, and regardless of what it decides, so
   an event we reject still teaches us Salesforce's state — which is what
   collapses repair into the single condition 8.3.
+- **Value equality is checked before the order key.** Inside step (c) the order
+  is: echo, then *value already equals the current value* (`confirmed`), then
+  the order-key comparison, then `superseded`. A change whose canonical value
+  already equals the current value changes **nothing** — not the value, not the
+  order key, and not history. `field_change` is the record of edits that
+  *changed* something, so a re-save of the value already held does not belong in
+  it; and restamping on a no-op would let someone who re-submitted a value they
+  did not change take ownership of the field from a genuine edit, which a later
+  real edit from the other side could then lose to. This is a third layer of
+  idempotence beneath 8.1's two, and the strict `>` is still the backstop for a
+  *different* value arriving with an older stamp.
 
 **Resolving the record, including creates:**
 

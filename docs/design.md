@@ -429,13 +429,17 @@ applyChanges(input: {
   occurredAt: Instant,              // from the payload if salesforce, from our clock if portal (A9)
   originEventId: string,            // webhook eventId, or the portal change id
   changes:   { [field]: rawValue },
-  payloadShape: "changed-fields" | "full-record",   // A3 and part 8.4
-}) : Array<{ field, outcome: "applied"|"superseded"|"echo"|"confirmed",
+}) : Array<{ field, outcome: "applied"|"superseded"|"echo"|"confirmed"|"restatement",
              previousValue, newValue, enqueuedOutbound: boolean }>
 ```
 
-One function, called from two places, carrying everything in parts 7 to 9
-behind it. Callers must know three things and no more: it must be called
+One function, called from **three** places — the webhook endpoint, the
+portal's save handler, and the outage recovery sweep — carrying everything in
+parts 7 to 9 behind it. Note what is *not* a parameter: whether the payload is
+changed-fields-only or a full record (A3). The merge does not need to know,
+because part 8.4's restatement rule gives the right answer in both cases, and
+a parameter that selects between two behaviours is two interfaces wearing one
+name. Callers must know three things and no more: it must be called
 inside a transaction the caller owns; it takes **one lock per record** — the
 `record_link` row — so every concurrent merge on one record serialises, in
 either direction, with no lock ordering for a caller to get right; and it is
@@ -883,8 +887,11 @@ BEGIN                                                    -- one transaction, no 
   |                field_version.sf_value      := value
   |                field_version.sf_observed_at := occurredAt
   |
-  |        (b) in full-record mode, a field equal to the sf_value we already
-  |            held is a restatement, not a change: skip (c) entirely   (part 8.4)
+  |        (b) a field whose value equals the sf_value we already held is a
+  |            RESTATEMENT, not a change: skip (c) entirely.      (part 8.4)
+  |            A null sf_value means we have never heard Salesforce's value
+  |            for this field, so the incoming value is a change, not a
+  |            restatement. This runs in both payload shapes -- see 8.4.
   |
   |        (c) decide the current value:
   |            if echo:                                                     (part 9)
@@ -1536,10 +1543,13 @@ and enqueues the repair we already owed. Meanwhile `phone` differs from its
 `sf_value`, so it is a real change and applies normally. Both fields come out
 right.
 
-Two things worth saying about this. First, it costs nothing extra to support:
-`sf_value` and `sf_observed_at` exist for part 8.3 anyway, so full-record mode
-is one comparison, and I would run step (b) in both modes to keep one code
-path. Second, it is still weaker than changed-fields-only, because a
+Two things worth saying about this. First, **step (b) is unconditional** — it
+runs whatever shape the payload has. It costs nothing, because `sf_value` and
+`sf_observed_at` exist for part 8.3 anyway; in changed-fields mode it only ever
+skips a re-save of an identical value, which is a no-op in any case; and it is
+*required* by the outage sweep (part 10.3) regardless of what the webhook looks
+like. Making it unconditional is why `applyChanges` needs no payload-shape
+parameter at all. Second, it is still weaker than changed-fields-only, because a
 restatement that happens to coincide with a real Salesforce edit to the same
 field *in the same payload* is invisible to us — the values are equal, so we
 cannot tell a deliberate re-save from an unchanged field. That residual gap is
@@ -1762,7 +1772,8 @@ and 34,900 Salesforce-touched records out of 5 million, the expected overlap is
 timing and protects about a hundred records in six million edits — and those
 hundred are exactly the ones where an edit would be silently destroyed.
 
-**The sweep runs in full-record mode, and must.** A `SystemModstamp` is a
+**The sweep relies on the restatement rule, and could not work without it.**
+A `SystemModstamp` is a
 *record's* modification time, not a field's, so a record touched at 17:00 hands
 us every one of that record's fields stamped 17:00 — including fields last changed months
 ago. Compared as changes, those would beat any portal edit made during the
@@ -1770,8 +1781,8 @@ outage and overwrite it with Salesforce's stale value. Step (b) of part 5.1 is
 what stops it: a field whose value equals the `sf_value` we already held is a
 restatement, skipped and not restamped. So the rule written for A3's "other
 case" turns out to be **required by outage recovery no matter which payload
-shape the webhook uses**, which is why part 8.4 runs it unconditionally rather
-than only in full-record mode.
+shape the webhook uses** — which is the reason part 8.4 makes it unconditional,
+and the reason the merge needs no payload-shape parameter.
 
 The sequence:
 

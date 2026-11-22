@@ -609,9 +609,12 @@ CREATE TABLE field_version (
   -- who and where, kept for display without reading history
   origin           text    NOT NULL,
   actor            text    NOT NULL,
-  -- what Salesforce last told us it holds for this field; only used in
-  -- full-record mode (A3, part 8.4). Null until Salesforce mentions the field.
+  -- what we believe Salesforce currently holds for this field, and the time of
+  -- the newest Salesforce-origin observation that told us so. This pair is the
+  -- whole basis of the repair rule (part 8.3) and of full-record mode (8.4).
+  -- Null until Salesforce has mentioned the field.
   sf_value         text,
+  sf_observed_at   timestamptz(3),
   PRIMARY KEY (object_type, portal_id, field)
 );
 ```
@@ -620,9 +623,9 @@ One row per record per field: at A1's scale, 1 million customers at 3 fields
 plus 4 million contacts at 6 fields is **27 million rows**.
 
 This table is a **cache, not a second source of truth.** Every column is
-derivable from `field_change` — the stamp is the latest applied change for that
-field, and `sf_value` is the newest Salesforce-origin change we applied or
-confirmed. It exists for two reasons: the comparison in part 7 becomes one
+derivable from `field_change` and `sync_observation` — the stamp is the latest
+applied change for that field, and `sf_value` / `sf_observed_at` come from the
+newest Salesforce-origin row of either, whatever its outcome. It exists for two reasons: the comparison in part 7 becomes one
 indexed point read instead of a sort over history, and it gives us a single row
 to take a lock on, which is how concurrent edits to one field serialise. A
 rebuild procedure from `field_change` is part of the operational runbook, and
@@ -820,20 +823,32 @@ BEGIN                                                    -- one transaction, no 
   |      changedBy = integration user?  -> echo
   |
   |-- 7. for each field in changedFields:
-  |        canonicalise the value                                           (part 7.2)
-  |        if echo:
-  |            sync_observation('echo'); field_version.sf_value = value
-  |        else if order_key(incoming) > order_key(stored):                 (part 7.1)
-  |            UPDATE customer/contact SET <field> = value
-  |            UPSERT field_version with the new stamp, sf_value = value
-  |            INSERT field_change(outcome='applied', old_value, new_value)
-  |            -- no outbound row: this change came FROM Salesforce
-  |        else if value <> current value:
-  |            INSERT field_change(outcome='superseded')                    (part 8.2)
-  |            field_version.sf_value = value
-  |            INSERT outbound_change(reason='repair')  -- Salesforce is wrong (part 8.3)
-  |        else:
-  |            sync_observation('confirmed'); field_version.sf_value = value
+  |        value := canonicalise(raw)                                       (part 7.3)
+  |
+  |        (a) learn what Salesforce holds -- unconditionally, before deciding
+  |            anything, and only if this is the newest word we have had:
+  |            if occurredAt > field_version.sf_observed_at or it is null:
+  |                field_version.sf_value      := value
+  |                field_version.sf_observed_at := occurredAt
+  |
+  |        (b) in full-record mode, a field equal to the sf_value we already
+  |            held is a restatement, not a change: skip (c) entirely   (part 8.4)
+  |
+  |        (c) decide the current value:
+  |            if echo:                                                     (part 9)
+  |                sync_observation('echo')          -- no value change, ever
+  |            else if order_key(incoming) > order_key(stored):             (part 7.2)
+  |                UPDATE customer/contact SET <field> = value
+  |                UPSERT field_version with the new stamp
+  |                INSERT field_change(outcome='applied', old_value, new_value)
+  |            else if value is distinct from the current value:
+  |                INSERT field_change(outcome='superseded')                (part 8.2)
+  |            else:
+  |                sync_observation('confirmed')
+  |
+  |        (d) the one repair condition, checked after every field:         (part 8.3)
+  |            if field_version.sf_value is distinct from the current value:
+  |                INSERT outbound_change(reason='repair')
   |
   |-- 8. UPDATE inbound_event SET outcome = <applied|echo|superseded|partial>
   v
@@ -856,6 +871,11 @@ Four properties of this shape are deliberate:
   event can be applied while another in the same event is superseded; the
   event's recorded outcome is then `partial`. Treating the event as the unit
   would mean one stale field dragging a fresh one down with it.
+- **Learning what Salesforce holds is separate from deciding what is true.**
+  Step (a) runs before step (c) and regardless of its outcome, so an event we
+  reject still teaches us Salesforce's state. That separation is what collapses
+  the repair rule into the single condition in step (d), and part 8.3 is why it
+  has to be a single condition.
 - **The 200 is sent after the commit, never before.** We never answer "accepted,
   will process shortly", because that turns the 200 into a promise we have no
   durable record of having made.
@@ -1304,3 +1324,169 @@ What I would do instead of engineering around it: keep our clock on NTP, and
 watch part 11's divergence number for a *systematic* bias in one direction,
 which is what a real skew problem looks like as opposed to the occasional
 genuine race.
+
+---
+
+## 8. The rule for a duplicate webhook, and for an older one arriving after a newer one
+
+### 8.1 A duplicate webhook
+
+**The rule: `eventId` is the idempotency key, claimed in the same transaction
+as the apply.**
+
+```sql
+INSERT INTO inbound_event (event_id, object_type, sf_id, occurred_at, payload_hash, outcome)
+VALUES ($1, $2, $3, $4, $5, 'in-progress')
+ON CONFLICT (event_id) DO NOTHING
+RETURNING event_id;
+```
+
+No row returned means we have seen this event. We commit and answer
+`200 {"status":"duplicate"}`, having changed nothing. Salesforce has done
+nothing wrong — A7 says it may deliver twice — so this is not an error and is
+not alerted, only counted.
+
+What makes this rule trustworthy is that it has **two independent layers**:
+
+1. **Suppression** — the table above. A duplicate does no work at all.
+2. **Harmlessness** — the strict `>` in the order key (part 7.2). Even if
+   layer 1 failed to suppress a duplicate, re-applying a change whose order key
+   already equals the stored one does nothing, because equal is not greater.
+
+The second layer is the one that lets me sleep. Layer 1 can be defeated:
+`inbound_event` is pruned at 30 days, a restore from backup could lose recent
+rows, and an operational mistake could truncate it. In every one of those cases
+a redelivered event is still a no-op. Layer 1 is an optimisation that saves
+work; layer 2 is the correctness guarantee. A design with only layer 1 is one
+retention policy away from corrupting data.
+
+Three details:
+
+- **Retention is 30 days**, which costs 104 MB (part 4.7). The window only has
+  to exceed Salesforce's retry horizon, and since the cost is negligible there
+  is no reason to trim it close.
+- **Same `eventId`, different `payload_hash`** is a provider bug: the first
+  write wins, we do not apply the second, and this one *is* alerted, because it
+  means the key we are trusting is not unique.
+- **A duplicate is not an echo.** A duplicate is one event delivered twice and
+  carries the same `eventId`. An echo is a genuine, distinct event — with its
+  own `eventId` — that happens to describe our own write. They arrive looking
+  similar and need different rules, which is why `CONTEXT.md` separates the
+  words.
+
+### 8.2 An older webhook arriving after a newer one
+
+**The rule: compare order keys per field; a change that is not strictly newer
+never becomes the current value, and is recorded as `superseded`.**
+
+Worked through, with the exercise's own sample shape:
+
+```
+evt_A  phone -> +919876500001   occurredAt 11:30:04.000   (sales.user)
+evt_B  phone -> +919876500002   occurredAt 11:30:09.000   (sales.user)
+
+B arrives first:
+    order_key(11:30:09.000, 1, evt_B) > stored  -> APPLIED
+    contact.phone        := +919876500002
+    field_version[phone] := (11:30:09.000, 1, evt_B)
+    sf_value             := +919876500002,  sf_observed_at := 11:30:09.000
+
+A arrives second:
+    (a) 11:30:04.000 is NOT newer than sf_observed_at 11:30:09.000
+        -> sf_value is left alone. We already know a later Salesforce state.
+    (c) order_key(11:30:04.000, 1, evt_A) < stored  -> SUPERSEDED
+        field_change += (phone, +919876500001, sales.user, 11:30:04, 'superseded')
+        the current value stays +919876500002
+    (d) sf_value (+919876500002) = current value  -> NO repair write
+```
+
+Step (a) is why this is correct and not merely plausible. A naive version of
+the repair rule — "the incoming value differs from ours, so tell Salesforce" —
+would fire here and waste a call, because `evt_A` describes a *past* state of
+Salesforce, not its current one. Tracking `sf_observed_at` alongside `sf_value`
+is what distinguishes "Salesforce disagrees with us" from "Salesforce told us
+about something old".
+
+**No reordering buffer, deliberately.** We do not hold events back hoping the
+missing earlier one arrives, because A11 gives us no sequence numbers, so we
+cannot detect that anything is *missing* — a buffer could only wait a fixed
+time and would add that latency to every event in order to maybe help a rare
+one. The per-field comparison gets the same answer without the latency. If open
+question 1 comes back as Change Data Capture, replay ids would let us detect a
+genuine gap, and then a short buffer becomes worth reconsidering.
+
+**An event can be partly applied.** Fields are independent (part 5.1), so one
+event may apply `phone` and supersede `city`; `inbound_event.outcome` is then
+`partial`.
+
+### 8.3 The repair write — one condition for every case
+
+Part 7.1 established that we are the only party that merges, so whenever our
+decision differs from what Salesforce holds, we owe Salesforce a call. With
+`sf_value` tracked separately from the merge decision, that whole obligation
+collapses into **one condition, checked after every field, regardless of what
+happened to it**:
+
+> **`if field_version.sf_value is distinct from the current value: enqueue a
+> repair write.`**
+
+Every case falls out of it rather than needing its own rule:
+
+| What happened | `sf_value` after | Current value | Repair? |
+| --- | --- | --- | --- |
+| Salesforce change applied | the new value | the same | no |
+| Salesforce value superseded by a newer portal edit | Salesforce's value | ours | **yes** — Salesforce is wrong |
+| older event after a newer one (8.2) | unchanged, the newer one | matches it | no |
+| echo of our own write | the value we sent | the same | no |
+| Salesforce restates a value we hold | that value | the same | no |
+| full-record restatement during an outage (8.4) | Salesforce's stale value | our unsent edit | **yes** — and we already owed it |
+
+**This terminates.** The repair sends our current value; Salesforce stores it
+and echoes it; the echo sets `sf_value` to that same value; the condition is
+then false and no further repair is created. One repair, one echo, done — and
+part 9's rule L1 is the general statement of why.
+
+The same condition is also the entire logic of outage recovery (part 10.3).
+The sweep reads Salesforce's current values, feeds them in as observations, and
+the fields needing repair are exactly the ones where the condition comes out
+true. Recovery needed no special code, which is a good sign the condition is at
+the right level.
+
+### 8.4 If a webhook carries the full record instead
+
+A3 assumes changed-fields-only. The exercise asks what the rule does
+otherwise, and the honest answer is that **full-record mode is the dangerous
+one**, because in it a field's silence and a field's restatement look
+identical.
+
+The hazard, concretely. During the outage, finance sets `city` to Noida at
+15:00; it is queued and unsent. At 16:00 a sales user changes the phone, and
+the full-record webhook carries `city: "Gurugram"` — Salesforce's stale copy —
+stamped 16:00. Compared as a change, `16:00 > 15:00`, so we would apply it and
+**overwrite the finance edit with an older value that Salesforce was merely
+restating.** That is exactly the data loss this whole exercise is about, caused
+by a payload shape.
+
+**The rule in full-record mode** is step (b) of part 5.1:
+
+> A field in the payload counts as a change only if its canonical value is
+> **distinct from the `sf_value` we already held**. A field equal to it is a
+> restatement: we do not restamp it, we do not compare it, we do not touch it.
+
+Traced through the hazard: `sf_value[city]` is already `Gurugram`, so the
+incoming `Gurugram` is a restatement and `city` is skipped; the current value
+stays Noida; and condition (d) sees `sf_value` Gurugram against current Noida
+and enqueues the repair we already owed. Meanwhile `phone` differs from its
+`sf_value`, so it is a real change and applies normally. Both fields come out
+right.
+
+Two things worth saying about this. First, it costs nothing extra to support:
+`sf_value` and `sf_observed_at` exist for part 8.3 anyway, so full-record mode
+is one comparison, and I would run step (b) in both modes to keep one code
+path. Second, it is still weaker than changed-fields-only, because a
+restatement that happens to coincide with a real Salesforce edit to the same
+field *in the same payload* is invisible to us — the values are equal, so we
+cannot tell a deliberate re-save from an unchanged field. That residual gap is
+the reason A3 is the assumption I would most like to have confirmed in writing,
+and why I would ask for changed-fields-only if the client has any say in how
+the webhook is built.

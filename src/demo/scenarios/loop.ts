@@ -31,17 +31,25 @@ export async function loop(): Promise<void> {
     actor: "finance.user@client.example",
     changedFields: { full_name: "Nikhil Rao", city: "Noida", phone: "+91 98765 00003" },
   });
-  kv("pending outbound rows", w.outbound().filter((r) => r.state === "pending").length);
+  const queued = w.outbound().filter((r) => r.state === "pending").length;
+  kv("pending outbound rows", queued);
   detail(
     'phone was canonicalised on the way in: "+91 98765 00003" -> ' +
       JSON.stringify(w.portalValues("Contact", portalId)["phone"]),
   );
+  // Asserted before anything else, because every later check in this scenario
+  // is of the form "and then nothing more was sent". If the first write never
+  // went out, all of them pass for the wrong reason — which is exactly how a
+  // real bug in the enqueue condition hid here once.
+  check(queued > 0, "the portal edit is owed to Salesforce");
 
   step("The worker sends it; Salesforce stores it and emits the echo.");
   const first = await w.worker.drain();
   kv("calls made", first.callsMade);
+  check(first.callsMade > 0, "the write actually reached Salesforce");
   const echoes = w.salesforce.drainWebhooks();
   kv("webhooks Salesforce emitted", echoes.length);
+  check(echoes.length > 0, "Salesforce emitted the echo we must not act on");
 
   step("We deliver the echo to our own endpoint.");
   for (const event of echoes) {
@@ -71,7 +79,8 @@ export async function loop(): Promise<void> {
     actor: "finance.user@client.example",
     changedFields: { city: "Gurugram" },
   });
-  await w.worker.drain();
+  const disguisedSend = await w.worker.drain();
+  check(disguisedSend.callsMade > 0, "the second write reached Salesforce too");
   const raw = w.salesforce.drainWebhooks();
   for (const event of raw) {
     // Rewrite the actor to a human, defeating L2 on purpose.
@@ -93,8 +102,16 @@ export async function loop(): Promise<void> {
     actor: "finance.user@client.example",
     changedFields: { phone: "+919876500004" },
   });
-  await w.worker.drain();
-  kv("what Salesforce stored", w.salesforce.recordValues(w.store.read((tx) => tx.findLinkByPortalId("Contact", portalId)?.sfId ?? ""))?.["phone"]);
+  const reformatSend = await w.worker.drain();
+  check(reformatSend.callsMade > 0, "the phone write reached Salesforce");
+  const sfId = w.store.read((tx) => tx.findLinkByPortalId("Contact", portalId)?.sfId ?? "");
+  const stored = w.salesforce.recordValues(sfId)?.["phone"];
+  kv("what we sent", w.portalValues("Contact", portalId)["phone"]);
+  kv("what Salesforce stored", stored);
+  check(
+    stored === "+91 98765 00004",
+    "Salesforce reformatted it, so the echo carries a different spelling",
+  );
   for (const event of w.salesforce.drainWebhooks()) {
     const res = w.deliver({ ...event, changedBy: "someone.else@client.example" });
     kv(`reformatted echo ${event.eventId}`, `${res.status} ${res.body.status}`);

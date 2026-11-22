@@ -955,7 +955,9 @@ BEGIN
       -- for each field that actually moved:
       --   UPDATE customer/contact SET <field> = canonical
       --   UPSERT field_version, INSERT field_change(outcome='applied')
-      --   INSERT outbound_change(reason='portal-edit')
+      -- then, per field, the same condition (d) the inbound path uses:
+      --   if sf_value is distinct from the current value:
+      --       INSERT outbound_change(reason='portal-edit')
 COMMIT
 NOTIFY outbound_ready
 ```
@@ -966,10 +968,12 @@ Salesforce are the same commit.** If the process dies immediately after
 edit did not happen and the user is told so. There is no third outcome, and
 that is what ADR 0001 bought.
 
-Note also what creates a row: only a field whose **current value actually
-moved**. A portal save that re-submits the same city creates no queue row at
-all. That is not an optimisation; it is rule L1 of part 9, and it is why loops
-cannot run.
+Note what creates a row: **condition (d) of part 5.1, the same one the inbound
+path uses** — we owe Salesforce a call exactly when we believe its value for a
+field differs from ours. A portal save that re-submits the same city moves
+nothing and creates no row; a portal save that happens to set a field to the
+value Salesforce already holds creates no row either. That is not an
+optimisation, it is rule L1 of part 9, and it is why loops cannot run.
 
 ### 6.2 The worker loop
 
@@ -1514,14 +1518,20 @@ what happens when one is removed.
 
 ### 9.2 L1 — the structural rule, and the only one that guarantees termination
 
-> **Outbound work is created only by a committed change to a current value in
-> our database, or by the repair condition of part 8.3. Nothing else enqueues
-> anything, ever.**
+> **Outbound work is created exactly when `field_version.sf_value` is distinct
+> from a field's current value — condition (d) of part 5.1, checked after every
+> field, on both paths, and nowhere else. Nothing else enqueues anything,
+> ever.**
 
-That is the whole rule, and it is a property of the write path rather than a
-check anybody has to remember to perform. An echo describes a value we already
-hold, so it moves no current value, so it creates no outbound work. **A loop
-has no fuel after one hop.**
+That single condition is the whole rule. It is not a check anybody has to
+remember to perform at the right moment; it is the one place in the design
+where outbound work comes from, and it says something simple: *we call
+Salesforce when and only when we believe Salesforce disagrees with us.*
+
+An echo tells us Salesforce now holds the value we just sent, which makes
+`sf_value` equal to the current value, which makes the condition false. **A
+loop has no fuel after one hop** — not because a rule caught it, but because
+there is nothing left to disagree about.
 
 Trace it with the exercise's own requirement — an update we send must not
 bounce back and forth forever:
@@ -1627,7 +1637,7 @@ and which record so the canonicalisation gap can be closed.
 
 | Layer | Guarantees termination? | What its absence costs |
 | --- | --- | --- |
-| **L1** structural: only a real transition enqueues | **yes** | everything. Without it no other layer saves us |
+| **L1** structural: we call only when we believe Salesforce disagrees | **yes** | everything. Without it no other layer saves us |
 | L2 actor check | no | echo noise in history; the create race of part 5.2(c) reopens |
 | L3 echo fence | no | occasional wasted requests, worst during catch-up |
 | L4 repair breaker | bounds the one way L1 fails | an unbounded two-system argument over one field |

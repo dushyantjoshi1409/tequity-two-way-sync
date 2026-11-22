@@ -9,7 +9,8 @@ field's history kept.
 
 | Path | What it is |
 | --- | --- |
-| `docs/design.md` | **The design document. Start here.** The exercise's 12-part outline, assumptions first, with four appendices: A the brief's scenario traced, B the hardest race, C interfaces/schema/sequences, D assumption consequences and rejected alternatives. |
+| `docs/design.md` | **The design document. Start here.** The exercise's 12-part outline, assumptions first. It carries every rule, interface and number, and nothing else. |
+| `docs/design-appendix.md` | The working behind the design, for checking a decision rather than building from it: A the brief's scenario traced, B the hardest race, C interfaces/schema/sequences, D each assumption's consequence and the alternatives rejected, E what the demo substitutes for, F the argument behind every rule, by section. |
 | `CONTEXT.md` | Glossary. The project's domain vocabulary, fixed before the design leans on it. |
 | `docs/adr/` | Decision records for the three choices that are expensive to reverse. |
 | `src/`, `package.json` | The optional demo. TypeScript on Node 20+, a fake Salesforce, no external services. |
@@ -21,9 +22,10 @@ field's history kept.
 3. `docs/design.md` parts 7-10 — the four rules: same-record conflict,
    duplicates and out-of-order, loop termination, and the 6-hour outage with
    the arithmetic.
-4. `docs/design.md` appendix A — the exercise's own worked scenario (phone in
-   Salesforce, city in the portal) traced through every rule, and appendix B —
-   the overwrite race, which is where tracing found a real bug.
+4. `docs/design-appendix.md` appendix A — the exercise's own worked scenario
+   (phone in Salesforce, city in the portal) traced through every rule, and
+   appendix B — the overwrite race, which is where tracing found a real bug.
+   Appendix F holds the reasoning behind each rule the design document states.
 
 ## Running the demo
 
@@ -35,7 +37,7 @@ npm test         # the unit tests at the rule seams
 
 Node 20 or newer. No network, no services, no credentials — a fake Salesforce
 written for this repository stands in for the real one, and a JSON document on
-disk stands in for Postgres. `docs/design.md` appendix E lists every
+disk stands in for Postgres. `docs/design-appendix.md` appendix E lists every
 substitution and says which guarantees are real and which are imitated.
 
 The demo runs six scenarios. Four are the checks the exercise names — a

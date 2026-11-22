@@ -1,7 +1,7 @@
 /**
  * Row shapes for the durable store, one per table in part 4 of
- * `docs/design.md`. Field names mirror the SQL in Appendix C.2 so the two can
- * be read side by side.
+ * `docs/design.md`. Field names mirror the SQL in `docs/design-appendix.md`
+ * Appendix C.2 so the two can be read side by side.
  */
 
 import type {

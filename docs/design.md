@@ -208,7 +208,7 @@ it. I have put each one where it would land.
 3. **What else in the client's Salesforce org consumes the API limit?** This is
    A12, and it sets one configured number.
 4. **When two portal users edit the same field, what should the second one
-   see?** I have answered it in part 7.4 with the rule I think is right — the
+   see?** I have answered it in part 7.5 with the rule I think is right — the
    save succeeds, the portal re-reads, and the loser is told who overwrote them
    — but the honest answer is that it is a product decision and I would rather
    the client made it.
@@ -421,7 +421,7 @@ control are the parts that dominate.
 | --- | --- | --- |
 | Salesforce emits the webhook | 5.0 s | A13, not ours, and the largest single term |
 | network | 0.5 s | public internet, TLS handshake amortised by keep-alive |
-| our apply transaction | 0.2 s | one dedup insert, at most 9 row locks, at most 9 history appends |
+| our apply transaction | 0.2 s | one dedup insert, one record lock, at most 6 field updates and 6 history appends |
 | **total** | **5.7 s** | |
 
 Both sides land inside 6 seconds at p99 against a 30-second worst case. The
@@ -581,7 +581,7 @@ CREATE TABLE customer (
 CREATE TABLE contact (
   portal_id     uuid PRIMARY KEY,
   full_name     text,
-  phone         text,          -- stored in canonical form, part 7.2
+  phone         text,          -- stored in canonical form, part 7.3
   email         text,          -- stored in canonical form
   city          text,
   owner         text,
@@ -602,7 +602,7 @@ CREATE TABLE field_version (
   object_type      text    NOT NULL,          -- 'Customer' | 'Contact'
   portal_id        uuid    NOT NULL,
   field            text    NOT NULL,
-  -- the order key, part 7.1. These three columns ARE the comparison.
+  -- the order key, part 7.2. These three columns ARE the comparison.
   occurred_at      timestamptz(3) NOT NULL,
   origin_rank      smallint NOT NULL,          -- salesforce = 1, portal = 0
   origin_event_id  text    NOT NULL,
@@ -1714,7 +1714,7 @@ hundred are exactly the ones where an edit would be silently destroyed.
 
 **The sweep runs in full-record mode, and must.** A `SystemModstamp` is a
 *record's* modification time, not a field's, so a record touched at 17:00 hands
-us all nine of its fields stamped 17:00 — including fields last changed months
+us every one of that record's fields stamped 17:00 — including fields last changed months
 ago. Compared as changes, those would beat any portal edit made during the
 outage and overwrite it with Salesforce's stale value. Step (b) of part 5.1 is
 what stops it: a field whose value equals the `sf_value` we already held is a

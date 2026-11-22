@@ -224,3 +224,213 @@ it. I have put each one where it would land.
    Salesforce?** I have assumed sync is invisible to the user. If it has to be
    visible, the outbound queue's state becomes a read model the portal renders,
    which is a small change made expensive by being discovered late.
+
+---
+
+## 2. The systems, who calls whom, the network seam, the interfaces
+
+### 2.1 The three parties and the two paths
+
+```
+   sales user                                finance / customer-success user
+       |                                                    |
+       | edits in                                           | edits in
+       v                                                    v
++-------------------+                            +-------------------------+
+|   SALESFORCE      |                            |   TEQUITY PORTAL        |
+|   (client's CRM,  |                            |   (our app)             |
+|   their database) |                            |                         |
++-------------------+                            +-------------------------+
+       |      ^                                        |            |
+       |      |                                        | in-process | in-process
+       |      |                                        v            v
+       |      |                              +------------------------------+
+       |      |                              |  MERGE  (the deep module)    |
+       |      |                              |  order keys, history,        |
+       |      |                              |  echo and repair decisions   |
+       |      |                              +------------------------------+
+       |      |                                     |            ^
+       |      |                                     v            |
+       |      |                              +------------------------------+
+       |      |                              |   POSTGRES  (our database)   |
+       |      |                              |   records, field history,    |
+       |      |                              |   outbound queue, watermark  |
+       |      |                              +------------------------------+
+       |      |                                  ^                |
+       |      |     ==== PUBLIC INTERNET ====    |                | claims rows
+       |      |          the only path           |                v
+       |      |                                  |      +--------------------+
+       |      |   (A) Salesforce calls us        |      |   SYNC WORKER      |
+       +------|------------------------------>  [1] ----+   our process      |
+              |   HTTPS webhook              endpoint   |   rate governor,   |
+              |                                         |   retries, sweep   |
+              |   (B) we call Salesforce                +--------------------+
+              +-----------------------------------------------+
+                  HTTPS Salesforce record API
+                  (create / update / changed-since query)
+
+  [1] = WEBHOOK ENDPOINT, our process. Validates, dedupes, calls MERGE, commits, returns 200.
+```
+
+Who calls whom, stated plainly:
+
+| Path | Caller | Callee | Trigger | Our cap |
+| --- | --- | --- | --- | --- |
+| A | Salesforce | our webhook endpoint | a record changed in Salesforce | none — inbound is outside the cap |
+| B | our sync worker | Salesforce record API | a field's current value changed in our database | 100 req/s hard, we run at 70 (A12) |
+| — | the portal's save handler | MERGE, in-process | a portal user saved the form | not a network call |
+
+A sales user never talks to the portal and a portal user never talks to
+Salesforce. Neither human crosses the internet seam; only paths A and B do.
+
+### 2.2 One service or two
+
+**Two processes, one deployable repository, and the seam between them is
+Postgres, not an HTTP call and not a broker.** The decision record is
+[ADR 0001](adr/0001-two-processes-with-postgres-as-the-seam.md); the short
+version:
+
+- The webhook endpoint is latency-sensitive, spiky, stateless and horizontally
+  scalable. It must return 200 fast and must never block on Salesforce, because
+  a slow Salesforce turning into a 500 from us would make Salesforce retry
+  work that already succeeded.
+- The sync worker is rate-capped and must behave as a single global governor of
+  a shared 100 req/s budget. That is the opposite scaling story: we want
+  exactly one of it, not N.
+- The outbound queue has to survive our process restarting — that is a hard
+  requirement, not a preference — so it is on disk regardless. Once it is on
+  disk in Postgres, the inbound apply and the outbound enqueue can be the
+  **same transaction**, which is the decisive argument: a separate broker would
+  make "we changed a value" and "we owe Salesforce a call" two facts that can
+  disagree after a crash.
+
+**What crosses the boundary between them:** rows, in two tables, in one
+direction each.
+
+| Table | Written by | Read by | Meaning |
+| --- | --- | --- | --- |
+| `outbound_change` | endpoint and portal (inside the merge transaction) | sync worker | "a field's current value moved; Salesforce does not know yet" |
+| `echo_fence` | sync worker (after a successful send) | endpoint | "we just wrote this exact value to Salesforce; expect it back" |
+
+Nothing else. No RPC, no shared in-memory state, no ordering dependency
+between the two processes beyond what the rows carry.
+
+### 2.3 The interface on each side
+
+Four interfaces matter. For each I give what a caller must know, which in this
+design includes the failure modes and the ordering guarantees, not just the
+shape of the payload.
+
+**(i) Our webhook endpoint — the interface Salesforce sees.**
+
+```
+POST /sync/salesforce/webhook
+  X-Signature: hex(hmac-sha256(shared_secret, raw_request_body))     (A7)
+  Content-Type: application/json
+
+  { "eventId":       "evt_1001",                 required, our idempotency key
+    "recordId":      "0031A00000Abc",            required, Salesforce id
+    "objectType":    "Contact" | "Account",      required
+    "occurredAt":    "2026-11-02T11:30:04.000Z", required, UTC ms  (A11)
+    "changedBy":     "sales.user@client.example",required            (A6)
+    "changedFields": { "phone": "+919876543210" } required, >= 1 entry  (A3)
+  }
+
+200 {"status":"applied"|"duplicate"|"echo"|"partially-superseded"}
+    the event is durably accounted for; do not send it again
+400 malformed or unknown objectType / field  — do not retry, it will not improve
+401 signature did not verify                 — do not retry
+429 we are shedding load                     — retry with backoff
+500 we failed unexpectedly                   — please retry; the retry is safe
+```
+
+The two facts a caller most needs: **a 200 is only returned after our
+transaction has committed**, and **re-delivering an event that got a 200 is
+harmless** (part 8). We never return 200 to mean "accepted, will process
+later", because that would make the 200 a lie we cannot recover from.
+
+**(ii) The Salesforce record API — the interface we call.** Exactly three
+operations, which is the entire surface we depend on:
+
+```
+update   PATCH  /services/data/vXX.X/sobjects/{Type}/{sfId}
+                body: { "<SalesforceField>": <value>, ... }   -> 204
+upsert   PATCH  /services/data/vXX.X/sobjects/{Type}/{ExtIdField}/{portalId}
+                body: { ... }                                  -> 201 created | 204 updated   (A5)
+changed  GET    /services/data/vXX.X/query?q=SELECT Id,<fields>,SystemModstamp
+                     FROM {Type} WHERE SystemModstamp > {watermark}
+                     ORDER BY SystemModstamp
+                -> { records: [...], done: bool, nextRecordsUrl }   (A4)
+```
+
+Every one of the three is idempotent, and that is a design requirement rather
+than an observation: `update` sends current values so repeating it converges,
+`upsert` is keyed on our own identifier so repeating it cannot make a second
+record, and `changed` is a read. This is what makes at-least-once sending safe
+in part 6.
+
+**(iii) MERGE — the one interface both edit paths go through.**
+
+```
+applyChanges(input: {
+  record:    { objectType, salesforceId? , portalId? },
+  origin:    "salesforce" | "portal",
+  actor:     ActorId,
+  occurredAt: Instant,              // from the payload if salesforce, from our clock if portal (A9)
+  originEventId: string,            // webhook eventId, or the portal change id
+  changes:   { [field]: rawValue },
+  payloadShape: "changed-fields" | "full-record",   // A3 and part 8.4
+}) : Array<{ field, outcome: "applied"|"superseded"|"echo"|"confirmed",
+             previousValue, newValue, enqueuedOutbound: boolean }>
+```
+
+One function, called from two places, carrying everything in parts 7 to 9
+behind it. Callers must know three things and no more: it must be called
+inside a transaction the caller owns; it takes row locks per field in a fixed
+field order, so concurrent calls on one record serialise rather than deadlock;
+and it is idempotent in the strict sense that calling it twice with the same
+`originEventId` and `occurredAt` changes nothing the second time.
+
+**(iv) The seam at Salesforce itself.** `SalesforceClient` is the only module
+with a real seam in the sense that something actually varies across it: there
+are two adapters, the live HTTPS client and the fake the demo runs against.
+Deliberately *not* behind a seam: Postgres. There is one adapter and there
+will only ever be one, so abstracting it would buy a hypothetical seam at the
+cost of hiding the transaction semantics that parts 5 and 6 depend on.
+
+### 2.4 Does the 30-second target close?
+
+It does, with about two-thirds of the budget unused, and the parts we do not
+control are the parts that dominate.
+
+**Portal edit -> visible in Salesforce** (path B):
+
+| Step | p99 | Why |
+| --- | --- | --- |
+| portal transaction commits, `outbound_change` row is in it | — | same transaction, no delay |
+| worker notices | 1.0 s | `LISTEN`/`NOTIFY` on commit, with a 1 s poll as the fallback |
+| coalescing window | 1.0 s | part 6.3; deliberate, to batch a multi-field form save |
+| queue wait | 0.1 s | at 7.4 req/s against a 70 req/s governor we are 11% utilised (part 6.5) |
+| Salesforce write | 2.0 s | A13, not ours |
+| **total** | **4.1 s** | **8.1 s if one retry is needed** |
+
+**Salesforce edit -> visible in the portal** (path A):
+
+| Step | p99 | Why |
+| --- | --- | --- |
+| Salesforce emits the webhook | 5.0 s | A13, not ours, and the largest single term |
+| network | 0.5 s | public internet, TLS handshake amortised by keep-alive |
+| our apply transaction | 0.2 s | one dedup insert, at most 9 row locks, at most 9 history appends |
+| **total** | **5.7 s** | |
+
+Both sides land inside 6 seconds at p99 against a 30-second worst case. The
+slack is deliberate: 24 seconds of it is there to absorb A13 being wrong, since
+Salesforce's emission delay and write latency together are 7 of our 9.8
+seconds and neither is something we can fix.
+
+The inbound path has no queue of its own. At A1's peak the endpoint commits 14
+transactions a second, which is nothing for Postgres, and adding an inbound
+queue would add a component and a lag term to buy headroom we do not need. The
+condition for adding one is explicit: **inbound apply p99 above 1 second, or
+sustained commits above 500/second.** Until then, inlining the apply is
+strictly better, and part 3 is the general form of that argument.

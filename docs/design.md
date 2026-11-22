@@ -1379,32 +1379,38 @@ with part 11's third number. Either way it is rare enough that getting the rule
 *right* matters much more than making it fast, which is why part 5 spends a
 record-level lock on it without hesitating.
 
-### 7.6 The honest weakness: two clocks
+### 7.6 Two clocks: the rule for the skew window
 
-A webhook's `occurred_at` comes from Salesforce's clock and a portal save's
-comes from ours, and 7.2 compares them directly. Within the skew window (A10,
-assumed 2 seconds) the ordering of a cross-side same-field pair can be wrong:
-an edit genuinely made second can be ranked first.
+A webhook's `occurred_at` is Salesforce's clock and a portal save's is ours, so
+7.2 compares two clocks. Inside the skew window (A10: 2 seconds) an edit
+genuinely made second can rank first.
 
-I am accepting that rather than engineering around it, for three reasons:
+**The rule: the order key stays authoritative inside the window. We do not
+detect or correct an inversion. We bound the skew, and we measure and page on
+the inversions.**
 
-1. **It cannot cause divergence,** only mis-ranking. The comparison is made in
-   one place, by one system, deterministically, so our copy never oscillates
-   and the repair write brings Salesforce into line with whatever we decided.
-2. **Nothing is lost.** The mis-ranked edit is in `field_change` with its
-   actor and its time; the client's history requirement is met either way, and
-   a human looking at the two rows can see what happened.
-3. **The alternative needs something we do not have.** A correct cross-side
-   order needs a single sequencer both sides share — Salesforce Change Data
-   Capture replay ids would be it (A11), which is why open question 1 is the
-   highest-value question on the list.
+| | |
+| --- | --- |
+| **Bound it** | our hosts run NTP; drift above **500 ms** is a host alarm, so of A10's 2 seconds at most a quarter is ours |
+| **Measure it** | **cross-side near-tie inversions per hour** — `field_change` rows with `outcome='superseded'` whose superseding change has the opposite `origin` and `abs(delta occurred_at) <= 2 s`. This is the precise form of part 11's third number |
+| **Warn** | 5 per hour |
+| **Call someone** | **20 per hour**, or any rolling 4-hour window in which **80% or more** of inversions resolve in favour of one origin |
 
-What I would do instead of engineering around it: keep our clock on NTP, and
-watch part 11's divergence number for a *systematic* bias in one direction,
-which is what a real skew problem looks like as opposed to the occasional
-genuine race.
+The bias threshold is the one that matters. Genuine races go both ways, so a
+sustained one-directional result is the signature of real skew rather than real
+contention, and it can sit under any volume threshold indefinitely.
 
----
+**Why no deterministic in-window tiebreak.** Any such rule would have to rank
+edits by something other than time, and both candidates are worse than the
+inversion they fix: arrival order at our endpoint is confounded by Salesforce's
+emission delay, which at 5 seconds (A13) is larger than the skew itself; and a
+fixed origin preference inside the window would make Appendix B's race resolve
+on the finance value rather than the sales one. A correct cross-side order
+needs a sequencer both sides share, which is open question 1.
+
+**What being wrong costs, bounded:** the mis-ranked edit is in `field_change`
+with its actor and time, both copies still converge on the same value, and the
+nightly full sweep (10.6) is the backstop.
 
 ## 8. The rule for a duplicate webhook, and for an older one arriving after a newer one
 
@@ -1994,16 +2000,19 @@ inbound queue.
 ### Number 3 — the divergence rate
 
 ```sql
--- per minute, summed:
---   outbound_change rows with reason = 'repair'
--- + field_change rows with outcome = 'superseded' AND origin = 'salesforce'
+-- (i) volume, per minute, summed:
+--     outbound_change rows with reason = 'repair'
+--   + field_change rows with outcome = 'superseded' AND origin = 'salesforce'
+-- (ii) skew, per hour: cross-side near-tie inversions, defined in part 7.6 --
+--     superseded rows whose superseding change has the opposite origin and
+--     abs(delta occurred_at) <= 2 s
 ```
 
-| | |
-| --- | --- |
-| **Normal** | near zero — part 7.5 estimates one or two genuine races a day |
-| **Warn** | 10 per minute |
-| **Call someone** | **100 per minute**, or any sustained one-directional bias |
+| | Volume (i) | Skew (ii) |
+| --- | --- | --- |
+| **Normal** | near zero | under 1 per hour |
+| **Warn** | 10 per minute | 5 per hour |
+| **Call someone** | **100 per minute** | **20 per hour**, or a rolling 4-hour window in which **80%+** resolve in favour of one origin |
 
 This is the number that catches being *wrong* rather than being slow, and
 nothing else in the system would report any of what it catches: a clock skew

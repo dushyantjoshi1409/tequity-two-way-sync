@@ -553,3 +553,229 @@ have to exist first to justify it:
 - **No per-field ownership table.** That is open question 6; if some fields
   turn out to be single-owner, S1 gets simpler for those fields, and a table
   built before the answer would be a guess.
+
+---
+
+## 4. The data we store
+
+Eight tables. Three hold the client's data, two are the machinery of the two
+paths, and three are small bookkeeping. The organising decision is in
+[ADR 0002](adr/0002-merge-per-field-not-per-record.md): **the unit of sync is a
+field, not a record.**
+
+### 4.1 The current values — what the portal reads and writes
+
+Ordinary typed tables, the shape the portal already wants. The sync does not
+impose a schema on the application.
+
+```sql
+CREATE TABLE customer (
+  portal_id     uuid PRIMARY KEY,
+  name          text,
+  status        text,
+  owner         text,
+  updated_at    timestamptz NOT NULL
+);
+
+CREATE TABLE contact (
+  portal_id     uuid PRIMARY KEY,
+  full_name     text,
+  phone         text,          -- stored in canonical form, part 7.2
+  email         text,          -- stored in canonical form
+  city          text,
+  owner         text,
+  customer_id   uuid REFERENCES customer(portal_id),
+  updated_at    timestamptz NOT NULL
+);
+```
+
+Nine syncable fields across the two tables, exactly the nine the exercise
+names (A14). **The current value of a field lives here and nowhere else** —
+that is deliberate, and it is why `field_version` below has no value column.
+Two copies of the current value would be two things that can disagree.
+
+### 4.2 The stamps — which change won, per field
+
+```sql
+CREATE TABLE field_version (
+  object_type      text    NOT NULL,          -- 'Customer' | 'Contact'
+  portal_id        uuid    NOT NULL,
+  field            text    NOT NULL,
+  -- the order key, part 7.1. These three columns ARE the comparison.
+  occurred_at      timestamptz(3) NOT NULL,
+  origin_rank      smallint NOT NULL,          -- salesforce = 1, portal = 0
+  origin_event_id  text    NOT NULL,
+  -- who and where, kept for display without reading history
+  origin           text    NOT NULL,
+  actor            text    NOT NULL,
+  -- what Salesforce last told us it holds for this field; only used in
+  -- full-record mode (A3, part 8.4). Null until Salesforce mentions the field.
+  sf_value         text,
+  PRIMARY KEY (object_type, portal_id, field)
+);
+```
+
+One row per record per field: at A1's scale, 1 million customers at 3 fields
+plus 4 million contacts at 6 fields is **27 million rows**.
+
+This table is a **cache, not a second source of truth.** Every column is
+derivable from `field_change` — the stamp is the latest applied change for that
+field, and `sf_value` is the newest Salesforce-origin change we applied or
+confirmed. It exists for two reasons: the comparison in part 7 becomes one
+indexed point read instead of a sort over history, and it gives us a single row
+to take a lock on, which is how concurrent edits to one field serialise. A
+rebuild procedure from `field_change` is part of the operational runbook, and
+it is the repair for any suspicion that this table is wrong.
+
+### 4.3 The history — what the client is actually buying
+
+```sql
+CREATE TABLE field_change (
+  seq              bigserial,
+  object_type      text    NOT NULL,
+  portal_id        uuid    NOT NULL,
+  field            text    NOT NULL,
+  old_value        text,                       -- canonical form; null on create
+  new_value        text,                       -- canonical form
+  occurred_at      timestamptz(3) NOT NULL,    -- the order key of this change
+  origin_rank      smallint NOT NULL,
+  origin_event_id  text    NOT NULL,
+  origin           text    NOT NULL,
+  actor            text    NOT NULL,
+  outcome          text    NOT NULL CHECK (outcome IN ('applied','superseded')),
+  applied_at       timestamptz NOT NULL DEFAULT clock_timestamp(),
+  PRIMARY KEY (seq, applied_at)
+) PARTITION BY RANGE (applied_at);          -- monthly partitions
+
+CREATE INDEX ON field_change (object_type, portal_id, field, occurred_at DESC);
+```
+
+Append-only. Never updated, never deleted. Two outcomes live here and both are
+permanent:
+
+- **`applied`** — this change became the current value.
+- **`superseded`** — this was a real edit by a real person that lost the
+  order-key comparison. It is kept because the exercise is explicit that the
+  fact of an earlier edit stays on record after a later edit, and dropping it
+  counts as losing a change.
+
+"Who changed the phone, and who changed the city" is one indexed read of this
+table per field.
+
+### 4.4 The operational log — echoes and confirmations, which are not history
+
+```sql
+CREATE TABLE sync_observation (
+  object_type text, portal_id uuid, field text,
+  observed_value text, occurred_at timestamptz(3),
+  origin text, origin_event_id text, actor text,
+  outcome text NOT NULL CHECK (outcome IN ('echo','confirmed')),
+  observed_at timestamptz NOT NULL DEFAULT clock_timestamp()
+) PARTITION BY RANGE (observed_at);         -- monthly partitions, dropped at 90 days
+```
+
+Separate table, and the separation is the point. An **echo** is Salesforce
+telling us about our own write, and a **confirmed** observation is Salesforce
+telling us a value we already hold. Neither is an edit by a person, so neither
+belongs in the client's history — but both are exactly what you want when
+debugging a suspected loop, so they are kept for 90 days and then the whole
+partition is dropped. Mixing them into `field_change` would inflate the
+permanent history by about 30% with rows that are not history and would make
+partition-level pruning impossible, since a partition would hold both the
+permanent and the prunable.
+
+### 4.5 The two paths' machinery
+
+```sql
+-- inbound idempotency. Part 8.1.
+CREATE TABLE inbound_event (
+  event_id     text PRIMARY KEY,              -- Salesforce's eventId
+  object_type  text NOT NULL,
+  sf_id        text NOT NULL,
+  occurred_at  timestamptz(3) NOT NULL,
+  payload_hash bytea NOT NULL,                -- sha256 of the raw body
+  outcome      text NOT NULL,                 -- applied | echo | superseded | partial | rejected
+  received_at  timestamptz NOT NULL DEFAULT clock_timestamp()
+);
+CREATE INDEX ON inbound_event (received_at);  -- for the 30-day prune
+
+-- the durable outbound queue. Part 6. This is what "pending calls survive a
+-- restart" means concretely: these rows are committed with the edit itself.
+CREATE TABLE outbound_change (
+  id              bigserial PRIMARY KEY,
+  object_type     text NOT NULL,
+  portal_id       uuid NOT NULL,
+  field           text NOT NULL,
+  reason          text NOT NULL,              -- 'portal-edit' | 'repair' | 'create' | 'recovery'
+  occurred_at     timestamptz(3) NOT NULL,    -- order key of the change that created this row
+  state           text NOT NULL DEFAULT 'pending',
+                  -- pending | inflight | sent | failed
+  attempts        int  NOT NULL DEFAULT 0,
+  next_attempt_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+  lease_owner     text,
+  lease_until     timestamptz,
+  last_error      text,
+  created_at      timestamptz NOT NULL DEFAULT clock_timestamp(),
+  sent_at         timestamptz
+);
+CREATE INDEX ON outbound_change (state, next_attempt_at)
+  WHERE state IN ('pending','inflight');      -- the claim query's only index
+CREATE INDEX ON outbound_change (object_type, portal_id) WHERE state = 'pending';
+```
+
+Note what `outbound_change` does **not** store: the value to send. The sender
+reads the current value at send time (part 6.3), so a row queued three hours
+ago during an outage cannot deliver a value we have since superseded.
+
+### 4.6 The bookkeeping
+
+```sql
+-- identity across the two systems. S5. A portal-created record has a
+-- portal_id before it has an sf_id.
+CREATE TABLE record_link (
+  object_type text NOT NULL,
+  portal_id   uuid NOT NULL,
+  sf_id       text,                            -- null until Salesforce assigns one
+  linked_at   timestamptz,
+  PRIMARY KEY (object_type, portal_id)
+);
+CREATE UNIQUE INDEX ON record_link (object_type, sf_id) WHERE sf_id IS NOT NULL;
+
+-- "we just wrote this to Salesforce; expect to hear about it". Part 9, rule L3.
+CREATE TABLE echo_fence (
+  object_type text NOT NULL, portal_id uuid NOT NULL, field text NOT NULL,
+  value_hash  bytea NOT NULL,                  -- sha256 of the canonical value we sent
+  sent_at     timestamptz NOT NULL DEFAULT clock_timestamp(),
+  expires_at  timestamptz NOT NULL,            -- sent_at + 15 minutes
+  PRIMARY KEY (object_type, portal_id, field, value_hash)
+);
+
+-- how far through Salesforce's own change history we are confident. Part 10.
+CREATE TABLE sync_watermark (
+  object_type   text PRIMARY KEY,
+  system_modstamp timestamptz NOT NULL,        -- highest SystemModstamp we have seen (A4)
+  updated_at    timestamptz NOT NULL
+);
+```
+
+### 4.7 Does the storage close?
+
+| Table | Rows | Size | Retention |
+| --- | --- | --- | --- |
+| `customer` + `contact` | 5 M | ~1.2 GB | forever |
+| `field_version` | 27 M | ~5.5 GB with its index | forever, rebuildable |
+| `field_change` | 26 M/year (20 M edits at ~1.3 fields each) | ~5.2 GB/year | **forever** — it is the product |
+| `sync_observation` | ~8 M/year | ~1.4 GB/year | 90 days, ~350 MB live |
+| `inbound_event` | 14 M/year, 1.15 M live | ~104 MB | 30 days |
+| `outbound_change` | ~20 k at the worst moment of an outage | ~5 MB | sent rows pruned at 7 days |
+| `record_link` | 5 M | ~400 MB | forever |
+| `echo_fence` | ~5 k live | negligible | 15 minutes |
+| **first year total** | | **~13 GB** | |
+
+Growth is about 5 GB a year, essentially all of it permanent history. That is
+small enough that keeping history forever is a decision about the product, not
+a decision about the budget — which is the answer I want, because the exercise
+makes history a requirement and I would rather not have to argue about it
+later. The 30-day window on `inbound_event` is worth noting for the same
+reason: duplicate suppression costs 104 MB, so there is no reason to trim the
+window to anything that a Salesforce retry could plausibly outlive.

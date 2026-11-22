@@ -209,6 +209,37 @@ function applyOneField(
       actor: input.actor,
       outcome: "echo",
     });
+  } else if (value === currentBefore) {
+    // A change whose canonical value already equals the current value changes
+    // nothing — not the value, not the order key, and not history. Checked
+    // **before** the order-key comparison, for two reasons:
+    //
+    // 1. `field_change` is the client's record of edits that *changed*
+    //    something. A re-save of the value already held is not one, and
+    //    filling permanent history with no-op rows would make "who changed the
+    //    city" harder to answer — which is the thing the client is actually
+    //    buying (design 4, and the brief's own ask).
+    // 2. It must not restamp the order key. If a no-op re-save advanced the
+    //    stamp, it would take ownership of the field from a genuine edit: a
+    //    later real edit from the other side could then lose to someone who
+    //    re-submitted a value they did not change.
+    //
+    // This is a third layer of idempotence beneath the duplicate table and the
+    // strict `>` of design 7.2 — and the strict `>` is still the backstop that
+    // matters, because it is what handles a *different* value arriving with an
+    // older stamp (design 8.1 layer 2, 8.2).
+    outcome = "confirmed";
+    tx.appendObservation({
+      objectType,
+      portalId,
+      field,
+      observedValue: value,
+      occurredAtMs: input.occurredAtMs,
+      origin: input.origin,
+      originEventId: input.originEventId,
+      actor: input.actor,
+      outcome: "confirmed",
+    });
   } else if (stored === undefined || isStrictlyNewer(incoming, stored)) {
     // Strictly greater, `>` and not `>=` (design 7.2): re-applying a change
     // already applied does nothing, so the inbound path is idempotent

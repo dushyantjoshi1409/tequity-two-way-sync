@@ -94,6 +94,36 @@ function outboundOf(store: DurableStore): readonly OutboundRow[] {
   return store.read((tx) => [...tx.outboundRows()]);
 }
 
+/**
+ * The sender delivered everything pending (design 6.2). What we believe
+ * Salesforce holds is set by the sender itself (design 6.3), which lives
+ * outside this module, so these tests only clear the queue.
+ */
+function senderDelivers(store: DurableStore): void {
+  store.transaction((tx) => {
+    for (const row of tx.outboundRows()) {
+      if (row.state === "pending") row.state = "sent";
+    }
+  });
+}
+
+/**
+ * The sender exhausted its attempts and dead-lettered its rows (design 6.2,
+ * 6.5): nothing is pending any more, and because nothing reached Salesforce,
+ * what we believe Salesforce holds is unchanged.
+ *
+ * Used where a test needs the *disagreement* without the pending row, so that
+ * what condition (d) does next is visible rather than collapsed into the one
+ * pending row a field is allowed (design 4).
+ */
+function senderGivesUp(store: DurableStore): void {
+  store.transaction((tx) => {
+    for (const row of tx.outboundRows()) {
+      if (row.state === "pending") row.state = "failed";
+    }
+  });
+}
+
 /** The result for one field, asserted to exist. */
 function fieldResult(results: readonly AppliedField[], field: string): AppliedField {
   const found = results.find((r) => r.field === field);
@@ -220,8 +250,9 @@ describe("applyChanges: the repair breaker (design 9.4, rule L4)", () => {
   }
 
   /**
-   * A field the two sides agree on, owned by a portal save — so the queue is
-   * empty and the Salesforce edit below is the only thing that can fill it.
+   * A field the portal owns at 2000, which Salesforce last told us was
+   * Gurugram at 500 — and with nothing pending, because the sender gave up.
+   * Any call the next event owes is therefore a call that event raised.
    */
   function contestedField(store: DurableStore): void {
     createRecord(store, "Contact", "c-1");
@@ -232,7 +263,7 @@ describe("applyChanges: the repair breaker (design 9.4, rule L4)", () => {
       actor: "sales.user",
       occurredAtMs: 500,
       originEventId: "evt_0",
-      rawChanges: { city: "Noida" },
+      rawChanges: { city: "Gurugram" },
     });
     feed(store, {
       objectType: "Contact",
@@ -243,7 +274,11 @@ describe("applyChanges: the repair breaker (design 9.4, rule L4)", () => {
       originEventId: "chg_1",
       rawChanges: { city: "Noida" },
     });
-    assert.deepEqual(outboundOf(store), []);
+    senderGivesUp(store);
+    assert.deepEqual(
+      outboundOf(store).filter((r) => r.state === "pending"),
+      [],
+    );
   }
 
   /** The Salesforce event that loses, leaving a disagreement behind. */
@@ -255,7 +290,7 @@ describe("applyChanges: the repair breaker (design 9.4, rule L4)", () => {
       actor: "sales.user",
       occurredAtMs: 1_500,
       originEventId: "evt_1",
-      rawChanges: { city: "Gurugram" },
+      rawChanges: { city: "Sector 44" },
     });
   }
 
@@ -403,6 +438,61 @@ describe("applyChanges: idempotence (design 8.1 layer 2)", () => {
     });
   });
 
+  test("a re-save of the value already held does not take ownership of the field", () => {
+    withStore((store) => {
+      createRecord(store, "Contact", "c-1");
+      feed(store, {
+        objectType: "Contact",
+        portalId: "c-1",
+        origin: "salesforce",
+        actor: "sales.user",
+        occurredAtMs: 1_000,
+        originEventId: "evt_0",
+        rawChanges: { city: "Gurugram" },
+      });
+
+      // A portal user re-submits the value the field already holds — the form
+      // saves every field, so this happens on any save that touched something
+      // else. It is not an edit to this field.
+      const resave = feed(store, {
+        objectType: "Contact",
+        portalId: "c-1",
+        origin: "portal",
+        actor: "finance.user",
+        occurredAtMs: 5_000,
+        originEventId: "chg_1",
+        rawChanges: { city: "Gurugram" },
+      });
+      assert.equal(fieldResult(resave, "city").outcome, "confirmed");
+
+      // Not in permanent history: `field_change` is the record of edits that
+      // *changed* something, and no-op rows would make "who changed the city"
+      // harder to answer.
+      assert.equal(historyOf(store, "Contact", "c-1").length, 1);
+
+      // And not restamped. This is the consequence worth testing: had the
+      // re-save advanced the order key to 5000, the genuine Salesforce edit
+      // below would lose to someone who re-submitted a value they did not
+      // change.
+      const version = store.read((tx) => tx.getFieldVersion("Contact", "c-1", "city"));
+      assert.ok(version);
+      assert.equal(version.occurredAtMs, 1_000);
+      assert.equal(version.actor, "sales.user");
+
+      const realEdit = feed(store, {
+        objectType: "Contact",
+        portalId: "c-1",
+        origin: "salesforce",
+        actor: "sales.user",
+        occurredAtMs: 2_000,
+        originEventId: "evt_1",
+        rawChanges: { city: "Sector 44" },
+      });
+      assert.equal(fieldResult(realEdit, "city").outcome, "applied");
+      assert.equal(valuesOf(store, "Contact", "c-1").city, "Sector 44");
+    });
+  });
+
   test("replaying a whole multi-field event changes nothing the second time", () => {
     withStore((store) => {
       createRecord(store, "Contact", "c-1");
@@ -501,11 +591,7 @@ describe("applyChanges: the one repair condition (design 8.3, 9.1)", () => {
         rawChanges: { status: "active" },
       });
 
-      // A portal save re-stamps the same value — the form saves every field,
-      // so this is an ordinary save, not a no-op. It owes nothing, because
-      // Salesforce already agrees, which leaves the queue empty: the repair
-      // asserted below is unambiguously the one condition (d) raises for the
-      // superseded change, not a leftover row.
+      // Finance moves it on in the portal, which owes Salesforce a call...
       feed(store, {
         objectType: "Customer",
         portalId: "cust-1",
@@ -513,9 +599,17 @@ describe("applyChanges: the one repair condition (design 8.3, 9.1)", () => {
         actor: "finance.user",
         occurredAtMs: 3_000,
         originEventId: "chg_1",
-        rawChanges: { status: "Active" },
+        rawChanges: { status: "prospect" },
       });
-      assert.deepEqual(outboundOf(store), []);
+      assert.deepEqual(
+        outboundOf(store).map((r) => [r.field, r.reason]),
+        [["status", "portal-edit"]],
+      );
+
+      // ...and the sender gives up on it. The queue is now empty while the
+      // disagreement stands, so the row asserted below is unambiguously the
+      // one condition (d) raises for the superseded change.
+      senderGivesUp(store);
 
       const results = feed(store, {
         objectType: "Customer",
@@ -529,14 +623,16 @@ describe("applyChanges: the one repair condition (design 8.3, 9.1)", () => {
 
       assert.equal(fieldResult(results, "status").outcome, "superseded");
       assert.equal(fieldResult(results, "status").enqueuedOutbound, true);
-      assert.equal(valuesOf(store, "Customer", "cust-1").status, "Active");
+      assert.equal(valuesOf(store, "Customer", "cust-1").status, "Prospect");
 
       // Salesforce has no merge logic (design 7.1), so a webhook we reject is
       // not a no-op: it is the discovery that Salesforce holds a value we
       // rejected, and nobody else will fix that.
       assert.deepEqual(
-        outboundOf(store).map((r) => [r.field, r.reason, r.state, r.occurredAtMs]),
-        [["status", "repair", "pending", 2_000]],
+        outboundOf(store)
+          .filter((r) => r.state === "pending")
+          .map((r) => [r.field, r.reason, r.occurredAtMs]),
+        [["status", "repair", 2_000]],
       );
     });
   });
@@ -602,11 +698,7 @@ describe("applyChanges: the one repair condition (design 8.3, 9.1)", () => {
       // termination argument: the echo sets `sf_value` to the value we sent,
       // the condition goes false, and the loop dies for lack of anything left
       // to disagree about — no fuel after one hop.
-      store.transaction((tx) => {
-        for (const row of tx.outboundRows()) {
-          if (row.state === "pending") row.state = "sent";
-        }
-      });
+      senderDelivers(store);
       const results = feed(store, {
         objectType: "Contact",
         portalId: "c-1",
@@ -766,11 +858,7 @@ describe("applyChanges: a restatement does not clobber (design 8.4, 10.3)", () =
 
       // The sender exhausted its attempts during the outage and dead-lettered
       // the row, so nothing is pending for `city` any more.
-      store.transaction((tx) => {
-        for (const row of tx.outboundRows()) {
-          if (row.state === "pending") row.state = "failed";
-        }
-      });
+      senderGivesUp(store);
 
       const results = feed(store, {
         objectType: "Contact",
@@ -963,11 +1051,7 @@ describe("applyChanges: an echo changes nothing (design 9.2, Appendix B)", () =>
       );
 
       // The sender delivers it, so the queue is empty when the echo lands.
-      store.transaction((tx) => {
-        for (const row of tx.outboundRows()) {
-          if (row.state === "pending") row.state = "sent";
-        }
-      });
+      senderDelivers(store);
 
       const results = feed(store, {
         objectType: "Contact",

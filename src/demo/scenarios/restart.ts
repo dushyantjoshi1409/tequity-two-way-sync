@@ -107,11 +107,26 @@ export async function restart(): Promise<void> {
   check(second.status === 0, "the second process finished cleanly");
 
   step("The result.");
-  const final = World.create({ name: SCENARIO, fresh: false });
+  const final = World.create({ name: SCENARIO, fresh: false, ceilingPerSecond: 50 });
+  // The rows the first child failed on carry an exponential backoff, so some
+  // are deliberately not due yet. Waiting for them is the point rather than an
+  // inconvenience: the design keeps failed work and retries it later, so the
+  // check is that everything arrives, not that it arrives instantly.
+  const deadline = Date.now() + 15_000;
+  while (final.worker.pendingCount() > 0) {
+    if (Date.now() > deadline) {
+      throw new Error(
+        `queue did not drain within 15 s; ${final.worker.pendingCount()} rows remain`,
+      );
+    }
+    await new Promise((r) => setTimeout(r, 100));
+    await final.worker.drain();
+  }
   const rows = final.outbound();
   kv("rows now sent", rows.filter((r) => r.state === "sent").length);
   kv("rows still pending", rows.filter((r) => r.state === "pending").length);
   const sfId = final.store.read((tx) => tx.findLinkByPortalId("Contact", portalId)?.sfId ?? "");
+  kv("rows failed", rows.filter((r) => r.state === "failed").length);
   kv("Salesforce id assigned", sfId || "(none)");
   const sfValues = sfId ? final.salesforce.recordValues(sfId) : undefined;
   kv("Salesforce city", sfValues?.["city"]);

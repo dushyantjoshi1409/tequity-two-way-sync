@@ -34,6 +34,14 @@ export interface WorldOptions {
   readonly leaseMs?: number;
   /** Start from empty state. False when a scenario resumes after a restart. */
   readonly fresh?: boolean;
+  /**
+   * How long a clean run must last before the governor steps its rate back up
+   * (design 6.4 uses 30 s). Most scenarios want this short so they do not
+   * wait; the rate-cap scenario wants it long, because a fast recovery would
+   * step the rate back to the ceiling before the scenario can observe that a
+   * 429 halved it.
+   */
+  readonly recoveryStepMs?: number;
 }
 
 /** Everything a scenario needs. */
@@ -56,7 +64,7 @@ export class World {
       ceilingPerSecond: options.ceilingPerSecond ?? 1000,
       floorPerSecond: 1,
       increasePerStep: 5,
-      recoveryStepMs: 200,
+      recoveryStepMs: options.recoveryStepMs ?? 200,
       clock,
     });
     this.worker = new SyncWorker(

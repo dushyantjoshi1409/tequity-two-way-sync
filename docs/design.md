@@ -173,6 +173,7 @@ have to discard one of two concurrent edits to different fields.
 | `field_version` | the **order key** per `(record, field)`, plus `sf_value` / `sf_observed_at`: a cache, not a second truth |
 | `field_change` | **the history**: append-only, `applied` and `superseded`, both **permanent** |
 | `sync_observation` | `echo`, `confirmed`, `restatement`; 90-day partitions; not edits by people, so not history |
+| `inbound_event` outcome | `applied`, `superseded`, `partial`, `echo`, `restatement`, `confirmed`, `rejected` — an event that changed nothing records `confirmed`, never `applied` |
 | `inbound_event` | the duplicate key, 30-day retention (104 MB) — 8.1 |
 | `outbound_change` | the **durable queue**: which field is owed, **never the value** — 6.3 |
 | `record_link` | Salesforce id ↔ portal id, and the per-record lock |
@@ -251,7 +252,7 @@ we run at **11% utilisation** and the other 89% drains backlogs.
 On a slow-down signal (A8), nothing is dropped:
 
 ```
-rate := max(5, rate / 2)                   -- multiplicative decrease
+rate := max(floor, rate / 2)               -- multiplicative decrease, floor 5
 row.state := 'pending'
 row.next_attempt_at := now + (Retry-After, else 2^attempts s jittered, cap 300 s)
 row.attempts := attempts - 1               -- given back: not the row's fault
@@ -456,7 +457,8 @@ launder a stale value over a newer one (Appendix B).
 > hash of the canonical value sent, expiring in 15 minutes; an inbound change
 > matching an unexpired entry is an echo.
 
-> **9.4 — L4, the repair breaker.** Above **5 repairs to one field in an hour**,
+> **9.4 — L4, the repair breaker.** Once a field has had **more than 5 repairs
+> inside the hour** — so the sixth is still sent and the seventh is not —
 > enqueue nothing more for it, mark it contested, and alert.
 
 L3 is L2's guarantee keyed on the value rather than the actor, so it holds if A6
@@ -513,6 +515,9 @@ and the ordering costs no time. **The sweep also depends on the restatement rule
 17:00 hands back every field stamped 17:00. Appendix C.5 has the sequence: probe,
 hold the drain, page through the changed-since query feeding each record in as a
 full-record observation, advance the watermark per page, release at half rate.
+**The drain then skips what the sweep already settled:** at claim time a row
+whose field now has `sf_value` equal to the current value is marked sent without
+a request, because 8.3 says nothing is owed and the call would change nothing.
 
 **10.4 The arithmetic — every figure, in one table.** Every number in this
 document comes out of these lines; the table varies one assumption per row.

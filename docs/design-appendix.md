@@ -26,7 +26,7 @@ appear. The contact is `0031A00000Abc` in Salesforce and `P` in the portal.
 
 `evt_1`, `occurredAt 11:00:00.000`, `changedBy sales.user@client.example`.
 
-The Salesforce id is unknown and `changedBy` is a human, so 5.1 case (b):
+The Salesforce id is unknown and `changedBy` is a human, so design 5 case (b):
 mint `P`, write the `record_link`, apply every field as a first write. The
 email `ASHA@Client.example` is canonicalised to `asha@client.example` (7.3).
 
@@ -318,7 +318,7 @@ CREATE TABLE field_version (
   actor            text    NOT NULL,
   -- what we believe Salesforce currently holds for this field, and when we
   -- last learned it. Updated by a Salesforce observation AND by our own
-  -- successful send (part 6.4) -- a write of ours is the most recent thing we
+  -- successful send (part 6.3) -- a write of ours is the most recent thing we
   -- know about Salesforce's state. This pair is the whole basis of the repair
   -- rule (8.3) and the restatement rule (8.4). Null until either happens.
   sf_value         text,
@@ -349,7 +349,7 @@ CREATE TABLE sync_observation (
   object_type text, portal_id uuid, field text,
   observed_value text, occurred_at timestamptz(3),
   origin text, origin_event_id text, actor text,
-  outcome text NOT NULL CHECK (outcome IN ('echo','confirmed')),
+  outcome text NOT NULL CHECK (outcome IN ('echo','confirmed','restatement')),
   observed_at timestamptz NOT NULL DEFAULT clock_timestamp()
 ) PARTITION BY RANGE (observed_at);         -- monthly partitions, dropped at 90 days
 
@@ -360,7 +360,8 @@ CREATE TABLE inbound_event (
   sf_id        text NOT NULL,
   occurred_at  timestamptz(3) NOT NULL,
   payload_hash bytea NOT NULL,                -- sha256 of the raw body
-  outcome      text NOT NULL,                 -- applied | echo | superseded | partial | rejected
+  outcome      text NOT NULL,                 -- applied | echo | superseded | partial
+                                              -- | restatement | confirmed | rejected
   received_at  timestamptz NOT NULL DEFAULT clock_timestamp()
 );
 CREATE INDEX ON inbound_event (received_at);  -- for the 30-day prune
@@ -466,23 +467,30 @@ BEGIN                                                    -- one transaction, no 
   |            for this field, so the incoming value is a change, not a
   |            restatement. This runs in both payload shapes -- see 8.4.
   |
-  |        (c) decide the current value:
+  |        (c) decide the current value -- FIRST case that applies:
   |            if echo:                                                     (part 9)
   |                sync_observation('echo')          -- no value change, ever
+  |            else if value = the current value:                           (part 5)
+  |                sync_observation('confirmed')     -- no stamp, no history
   |            else if order_key(incoming) > order_key(stored):             (7.2)
   |                UPDATE customer/contact SET <field> = value
   |                UPSERT field_version with the new stamp
   |                INSERT field_change(outcome='applied', old_value, new_value)
-  |            else if value is distinct from the current value:
-  |                INSERT field_change(outcome='superseded')                (part 8.2)
   |            else:
-  |                sync_observation('confirmed')
+  |                INSERT field_change(outcome='superseded')                (part 8.2)
+  |
+  |            The value-equality test comes BEFORE the order-key comparison,
+  |            not after it. Reversed, a change that matches what we already
+  |            hold but carries a newer stamp would be 'applied' and would
+  |            RESTAMP the field -- taking ownership from a genuine edit, which
+  |            is exactly what F.5 says must not happen.
   |
   |        (d) the one repair condition, checked after every field:         (8.3)
   |            if field_version.sf_value is distinct from the current value:
   |                INSERT outbound_change(reason='repair')
   |
-  |-- 8. UPDATE inbound_event SET outcome = <applied|echo|superseded|partial>
+  |-- 8. UPDATE inbound_event SET outcome =
+  |        <applied|echo|superseded|partial|restatement|confirmed>
   v
 COMMIT
   |
@@ -499,11 +507,11 @@ every tick (on NOTIFY, or every 1 second as a fallback):
   0. hold the leader lease                            (ADR 0003)
      SELECT pg_try_advisory_lock(SENDER_LOCK_ID);  -- not held -> idle as standby
 
-  1. reclaim anything a dead process left behind      (6.6)
+  1. reclaim anything a dead process left behind      (6.2)
      UPDATE outbound_change SET state='pending', lease_owner=NULL, lease_until=NULL
       WHERE state='inflight' AND lease_until < clock_timestamp();
 
-  2. if the circuit breaker is open, probe instead of claiming   (6.5)
+  2. if the circuit breaker is open, probe instead of claiming   (6.4)
 
   3. claim a batch, whole records at a time           (6.3)
      WITH due AS (
@@ -527,8 +535,8 @@ every tick (on NOTIFY, or every 1 second as a fallback):
 
   4. group the claimed rows by (object_type, portal_id)
   5. for each group: read the CURRENT values of those fields, build one call   (6.3)
-  6. governor.acquire(1 token)  -- every request, retries included            (6.5)
-  7. send; settle the whole group by the outcome                              (6.7)
+  6. governor.acquire(1 token)  -- every request, retries included            (6.4)
+  7. send; settle the whole group by the outcome                              (6.5)
 ```
 
 ### C.5 Outage recovery
@@ -547,7 +555,7 @@ Part 10.3. The sweep must finish before the drain starts.
    after each page -> a crash resumes from the page boundary, and a
    small re-read overlap is harmless because applying an observation
    twice is a no-op (strict > in 7.2)
-5. RELEASE the drain, at half rate, ramping (part 6.5)
+5. RELEASE the drain, at half rate, ramping (part 6.4)
 ```
 
 ---
@@ -612,10 +620,11 @@ needs to know which guarantees are real and which are imitated.
 | **the partial unique index** (one pending row per field) | an explicit check in the enqueue path | imitated |
 | **`LISTEN` / `NOTIFY`** | the demo calls the worker directly | imitated |
 | **monthly partitions and pruning** | not implemented | absent — retention is a design concern, not a rule |
-| **the live Salesforce record API** | a fake written for this repository, file-backed so it survives the restart, with levers for the four behaviours the rules depend on: it echoes every write, it can be unreachable, it can answer 429, and it can refuse a record's data | the second adapter at the seam (part 2) |
+| **the live Salesforce record API** | a fake written for this repository, file-backed so it survives the restart, with levers for the five behaviours the rules depend on: it echoes every write, it can be unreachable, it can answer 429, it can refuse a record's data, and it can refuse our credentials | the second adapter at the seam (part 2) |
 | **HTTPS to the webhook endpoint** | the handler is called in-process, with the signature still verified over the raw body | imitated — the rules live in the handler, not in the HTTP framing |
 | **70 req/s** (part 6.4) | a deliberately low cap so the wait is visible, which the exercise permits. **The code enforces whatever cap it is given** | the enforcement is real, the number is not the design's |
-| **a 30-second lease** (part 6.5) | a shorter one, for the same reason | as above |
+| **a 30-second lease** (part 6.2) | a shorter one, for the same reason | as above |
+| **the governor's floor of 5 req/s** (part 6.4) | a floor of 1, because the demo's whole ceiling is 4 req/s | the halving and the ramp are real, the floor is not the design's |
 
 Two of these are worth stating as limits rather than details. The demo **does
 not** show the record-level lock doing its job, because proving that needs
@@ -631,7 +640,8 @@ design, since it can never mistake a real change for an echo.
 
 The body states the rules and the numbers. This is the reasoning behind them,
 keyed to the body's section numbers — the material a reader who wants to check a
-decision needs, and that a reader who only wants to build does not.
+decision needs, and that a reader who only wants to build does not. It starts at
+F.2 because part 1 is the assumptions, and their reasoning is Appendix D.
 
 ### F.2 The process split and the seam
 

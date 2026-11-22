@@ -914,3 +914,211 @@ event away forever, so it is only for payloads that are definitely malformed —
 an unknown field name is a 400, but an unexpected *value* in a known field is
 not, because a value we cannot canonicalise is our bug and deserves a 500 and
 a retry.
+
+---
+
+## 6. The outbound path: portal edit to Salesforce API call
+
+### 6.1 The portal save
+
+The portal's save handler does one transaction, and the queue row is inside it:
+
+```
+BEGIN
+  SELECT portal_id FROM record_link
+    WHERE object_type=$1 AND portal_id=$2 FOR UPDATE;   -- the same single lock as part 5
+  occurredAt := clock_timestamp()                        -- our clock, our record (A9)
+  actor      := session.principal                        -- NOT the editedBy in the body (A9)
+  applyChanges({ origin: 'portal', occurredAt, actor, changes, ... })
+      -- for each field that actually moved:
+      --   UPDATE customer/contact SET <field> = canonical
+      --   UPSERT field_version, INSERT field_change(outcome='applied')
+      --   INSERT outbound_change(reason='portal-edit')
+COMMIT
+NOTIFY outbound_ready
+```
+
+The one thing to see here: **the value change and the obligation to tell
+Salesforce are the same commit.** If the process dies immediately after
+`COMMIT`, the row is on disk and the call will happen. If it dies before, the
+edit did not happen and the user is told so. There is no third outcome, and
+that is what ADR 0001 bought.
+
+Note also what creates a row: only a field whose **current value actually
+moved**. A portal save that re-submits the same city creates no queue row at
+all. That is not an optimisation; it is rule L1 of part 9, and it is why loops
+cannot run.
+
+### 6.2 The worker loop
+
+```
+every tick (on NOTIFY, or every 1 second as a fallback):
+
+  0. hold the leader lease                            (ADR 0003)
+     SELECT pg_try_advisory_lock(SENDER_LOCK_ID);  -- not held -> idle as standby
+
+  1. reclaim anything a dead process left behind      (6.6)
+     UPDATE outbound_change SET state='pending', lease_owner=NULL, lease_until=NULL
+      WHERE state='inflight' AND lease_until < clock_timestamp();
+
+  2. if the circuit breaker is open, probe instead of claiming   (6.5)
+
+  3. claim a batch, whole records at a time           (6.3)
+     WITH due AS (
+       SELECT object_type, portal_id, MIN(next_attempt_at) AS due
+         FROM outbound_change
+        WHERE state='pending' AND next_attempt_at <= clock_timestamp()
+        GROUP BY object_type, portal_id
+        ORDER BY due                      -- oldest-due record first: no starvation
+        LIMIT 200
+     ), picked AS (
+       SELECT o.id FROM outbound_change o JOIN due USING (object_type, portal_id)
+        WHERE o.state='pending' AND o.next_attempt_at <= clock_timestamp()
+        FOR UPDATE SKIP LOCKED
+     )
+     UPDATE outbound_change o
+        SET state='inflight', lease_owner=$me,
+            lease_until=clock_timestamp() + interval '30 seconds',
+            attempts = o.attempts + 1
+       FROM picked p WHERE o.id = p.id
+     RETURNING o.*;
+
+  4. group the claimed rows by (object_type, portal_id)
+  5. for each group: read the CURRENT values of those fields, build one call   (6.3)
+  6. governor.acquire(1 token)  -- every request, retries included            (6.5)
+  7. send; settle the whole group by the outcome                              (6.7)
+```
+
+`attempts` is incremented when a row is **claimed**, not when it fails. A row
+that crashes the process mid-send therefore still counts, which is what stops a
+single poison row from crashing us in a loop forever. Section 6.5 explains the
+one case where the increment is given back.
+
+### 6.3 Coalescing, and reading the value late
+
+The claim takes **whole records**: up to 200 distinct records, and every
+pending row belonging to them. All the fields owed on one record become **one**
+Salesforce call. A form save that changed four fields is four queue rows and one
+PATCH.
+
+Then the part that matters more than the batching:
+
+> The sender reads each field's **current value at send time**, from the typed
+> table. It never sends a value carried on the queue row — which is why part 4.5
+> does not store one.
+
+Consider a 6-hour outage. A city edit at 09:00 and another at 11:00 leave two
+queue rows. When the link comes back at 15:00 we send **the 11:00 value, once**.
+Sending the queued values in order would mean two calls, double the drain cost,
+and a window during which Salesforce holds a value we superseded four hours
+ago. The same property makes the repair writes of part 8.3 safe: a repair row
+written at 09:00 sends whatever we currently believe, not what we believed then.
+
+The cost is that the queue row is a *claim ticket* rather than a message, so
+the queue cannot be read as a log of what we sent. `field_change` is that log,
+and it is a better one.
+
+### 6.4 The calls, and why each is safe to repeat
+
+| Case | Call | Idempotent because |
+| --- | --- | --- |
+| update an existing record | `PATCH /sobjects/{Type}/{sfId}` with current values | sending the same current values twice reaches the same state |
+| record created in the portal | `PATCH /sobjects/{Type}/{ExtIdField}/{portalId}` (A5) | keyed on **our** identifier, so a repeat updates the record it created rather than making a second one |
+| outage recovery read | `GET /query?q=... SystemModstamp > watermark` (A4) | a read |
+
+At-least-once delivery is the only thing a durable queue can honestly offer,
+so every call we make is built to be repeatable. That is why A5 is worth
+pushing for: without an external-id upsert, create is the one operation whose
+repeat is not safe, and the fallback (search, then create) is racy.
+
+On a `2xx` the sender writes the `echo_fence` rows for the fields it sent, then
+marks the group `sent`. The fence is written **after** the response, because a
+fence for a call that never landed would suppress a real Salesforce change.
+
+### 6.5 The rate cap, and slowing down without losing work
+
+**We run at 70 requests/second against the 100 the cap allows.** Both bounds
+are chosen, not inherited:
+
+- *Why not 100.* The cap counts our retries (the exercise is explicit), and it
+  is a property of the client's Salesforce org rather than of us, so anything
+  else in that org — another integration, a Data Loader job, a report —
+  competes with us. At 100 we would discover that by being rejected; at 70 a
+  30% burst from someone else is absorbed. A12 is the assumption behind this,
+  and it is the number I would most like confirmed.
+- *Why not lower.* Catch-up time after the outage scales inversely with this
+  number. Part 10 shows 70 drains the 6-hour backlog in about 4 minutes; at 20
+  it would be about 13.
+
+The governor is a token bucket: capacity 70, refill 70/second, one token per
+HTTP request **including every retry**. Steady state at A1 and A2 spends about
+7.4 tokens/second, so we run at roughly 11% utilisation and the remaining 89%
+is what drains a backlog.
+
+Throughput is reachable from one process: at 70 requests/second and a 2-second
+p99 (A13), Little's law gives 70 × 2 = **140 requests in flight**, which one
+Node process with a keep-alive pool handles without strain. Steady state needs
+about 15. There is no throughput reason to want a second sender, which is the
+other half of ADR 0003.
+
+**On a slow-down signal** (A8) — HTTP 429, or `REQUEST_LIMIT_EXCEEDED`:
+
+```
+rate := max(5, rate / 2)                 -- multiplicative decrease
+row.state := 'pending'
+row.next_attempt_at := now + (Retry-After, or 2^attempts seconds with jitter, capped at 300s)
+row.attempts := attempts - 1             -- give the attempt back: this was not the row's fault
+recover: rate := min(70, rate + 5) every 30 seconds of clean responses
+```
+
+Nothing is dropped. The work goes back to `pending` with a later due time, and
+the only thing that changed is how fast we are willing to spend the cap. The
+additive recovery is deliberately slower than the halving, so that a
+rate-limited period does not oscillate.
+
+**The circuit breaker, which is what makes a 6-hour outage survivable.** The
+sender distinguishes two kinds of failure:
+
+- An **endpoint failure** — connection refused, timeout, or 5xx — says nothing
+  about the row. After 5 consecutive ones the breaker opens: we stop claiming
+  entirely and send a single probe every 30 seconds. Rows already claimed go
+  back to `pending` **with their `attempts` restored**, and on close we resume
+  at half rate and ramp up.
+- A **row failure** — a 400-class rejection naming this record's data — is
+  about the row, and only this kind counts attempts toward giving up.
+
+Without that distinction a 6-hour outage would destroy its own backlog: 10
+attempts at a backoff capped at 5 minutes is under an hour, so every row would
+have been marked `failed` by the second hour of the outage. Separating the two
+is the difference between a backlog that waits and a backlog that dies.
+
+### 6.6 What a restart does
+
+Nothing that needs attention. The sequence:
+
+1. The new process acquires the advisory lock (or idles as a standby if
+   another holds it).
+2. Step 1 of the loop returns every row the dead process left `inflight` whose
+   30-second lease has expired. No manual intervention, no reconciliation
+   script.
+3. Sending resumes. Any row that had actually reached Salesforce before the
+   crash is sent again, and 6.4 is why that is safe.
+
+The 30-second lease is the one tuning choice: long enough that a slow call is
+not stolen from a live sender, short enough that a crash costs at most 30
+seconds of delay on the affected rows.
+
+### 6.7 Settling a group
+
+| Outcome | State | Attempts | Then |
+| --- | --- | --- | --- |
+| `2xx` | `sent` | — | write `echo_fence` rows; record `sent_at` |
+| `429` / limit exceeded | `pending` | restored | halve the rate; honour `Retry-After` |
+| timeout, connection error, `5xx` | `pending` | restored | count toward the breaker; backoff with jitter |
+| `400`-class, data rejected | `failed` | kept | **alert.** A value the portal accepts and Salesforce refuses is a schema disagreement a human must settle |
+| `404`, record gone | `failed` | kept | **alert.** Deletes are out of scope (A15), so this is unexpected by definition |
+| `401` / `403` | `pending` | restored | **page, and stop the sender.** Bad credentials would otherwise burn the whole queue into `failed` |
+
+A `failed` row is never deleted. It stays with its `last_error` as the queue's
+own record that something needs a person, and part 11's third number is how we
+find out.

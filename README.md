@@ -9,7 +9,7 @@ field's history kept.
 
 | Path | What it is |
 | --- | --- |
-| `docs/design.md` | **The design document. Start here.** Follows the exercise's 12-part outline, with the assumptions and open questions at the top. |
+| `docs/design.md` | **The design document. Start here.** The exercise's 12-part outline, assumptions first, with four appendices: A the brief's scenario traced, B the hardest race, C interfaces/schema/sequences, D assumption consequences and rejected alternatives. |
 | `CONTEXT.md` | Glossary. The project's domain vocabulary, fixed before the design leans on it. |
 | `docs/adr/` | Decision records for the three choices that are expensive to reverse. |
 | `src/`, `package.json` | Optional demo code (Phase 2). TypeScript on Node 20+, fake Salesforce, no external services. |
@@ -22,7 +22,8 @@ field's history kept.
    duplicates and out-of-order, loop termination, and the 6-hour outage with
    the arithmetic.
 4. `docs/design.md` appendix A — the exercise's own worked scenario (phone in
-   Salesforce, city in the portal) traced through every rule.
+   Salesforce, city in the portal) traced through every rule, and appendix B —
+   the overwrite race, which is where tracing found a real bug.
 
 ## Running the demo
 

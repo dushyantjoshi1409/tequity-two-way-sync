@@ -2,1622 +2,606 @@
 
 **Design document — Tequity Round 1**
 
-The client's sales team edits customers and contacts in Salesforce. The
-client's finance and customer-success staff edit the same records in the portal
-Tequity built, which stores them in Postgres. Both copies have to stay in sync
-within 30 seconds while both systems are up, every field's history has to be
-kept, and we only control our side.
+Sales edits customers and contacts in Salesforce; finance and customer-success
+edit the same records in the portal Tequity built on Postgres. Both copies must
+agree within 30 seconds while both are up, every field's history must be kept,
+and we control only our side.
 
-This document is written for a teammate who was not on the call. Parts 1 and 2
-are the context; parts 7 to 10 are the four rules the exercise asks for; the
-arithmetic is in part 10 and the running totals in part 2.3.
+Parts 7–10 are the four rules; all arithmetic is one table in 10.4. The
+appendices carry what the body points to: **A** the brief's scenario traced,
+**B** the hardest race, **C** schema, interfaces and sequences, **D** the
+reasoning behind each assumption and the alternatives rejected. `docs/adr/` has
+the three decisions expensive to reverse.
 
 ---
 
-## Summary — the whole design on one page
+## Summary
 
-**The one idea.** The unit of sync is a **field**, not a record. Every field
-carries an **order key** — `(occurred_at, origin_rank, origin_event_id)` — and
-the current value is the one whose order key is greatest. `occurred_at` is the
-webhook's `occurredAt` on the Salesforce side and our own database's
-`clock_timestamp()` on a portal save. Everything else follows from that.
+The unit of sync is a **field**, not a record. Each field carries an **order
+key** `(occurred_at, origin_rank, origin_event_id)` and the current value is
+the one whose key is greatest. `occurred_at` is the webhook's `occurredAt`
+inbound, our own `clock_timestamp()` on a portal save.
 
-**The shape.** Two processes, one repository. A **webhook endpoint** validates
-and applies inbound changes in a single Postgres transaction and answers 200
-only after it commits. A **sync worker** drains a durable queue to Salesforce
-under a rate governor. They never call each other: the seam between them is
-Postgres, which is what lets a value change and the obligation to tell
-Salesforce be the same commit.
+**Salesforce has no merge logic** — it overwrites with whatever lands last. We
+are the only party that compares anything, so our database holds the decision
+and Salesforce's copy is a projection of it. Hence the one rule everything
+follows from:
 
-**Salesforce does no merging.** It overwrites with whatever lands last, so we
-are the only party comparing anything. That makes our database the holder of
-the decision and gives the design its single most useful rule.
-
-**The one condition.** Outbound work is created exactly when
-`sf_value`— what we believe Salesforce holds for a field — differs from that
-field's current value. Checked after every field, on both paths, nowhere else.
-
+> **Outbound work is created exactly when `sf_value` — what we believe
+> Salesforce holds for a field — differs from that field's current value.**
+> Checked after every field, on both paths, nowhere else.
 > *We call Salesforce when, and only when, we believe Salesforce disagrees with us.*
 
-**The four rules the exercise asks for**, each a consequence of the above:
-
-| | Rule | Where |
+| Rule | | § |
 | --- | --- | --- |
-| **Duplicate webhook** | `eventId` is claimed in the same transaction as the apply. And the order-key comparison is strictly `>`, so a duplicate that escapes the table is a no-op anyway. | 8.1 |
-| **Out of order** | Compare order keys per field. A change that is not strictly newer never becomes current but is kept as `superseded`, with its actor and time. | 8.2 |
-| **Sync loop** | An echo tells us Salesforce holds the value we sent, which makes `sf_value` equal the current value, which makes the one condition false. The loop has no fuel after one hop. | 9.2 |
-| **6-hour outage** | Queue rows are committed with the edit, so they survive a restart. On recovery the inbound sweep runs **before** the outbound drain, or we would overwrite Salesforce edits we had not yet learned about. | 10.3 |
+| **Duplicate** | `eventId` claimed in the apply's own transaction; and the compare is strictly `>`, so a duplicate escaping the table is a no-op anyway | 8.1 |
+| **Out of order** | compare order keys per field; a change not strictly newer never becomes current, and is kept as `superseded` with its actor and time | 8.2 |
+| **Loop** | an echo makes `sf_value` equal the current value, so the condition goes false — no fuel after one hop | 9.1 |
+| **6-h outage** | queue rows commit with the edit, so they survive a restart; on recovery the inbound sweep runs **before** the outbound drain | 10.3 |
 
-**The numbers.** Assumed peak 20 edits/second, business-hours average 3, quiet
-hour 0.5. We run at **70 of the 100 requests/second** allowed, which steady
-state uses 11% of. A 6-hour outage queues **19,440 changes**, coalescing to
-**14,954 calls**, draining in **5.1 minutes** counting the governor's ramp;
-with the 1.2-minute inbound sweep first, **about 6.3 minutes end to end** — row
-1 of the table in part 10.4, which carries every what-if. A sustained peak
-would be 35.4 minutes, against a floor of 16.6 set by the cap itself. The 30-second target closes at about 6 seconds on both paths, of which
-7 of the 9.8 worst-case seconds belong to Salesforce rather than to us.
-
-**The three things I would most want answered:** how the webhook is actually
-produced (Change Data Capture would retire a third of part 8), whether an
-external-id field exists for idempotent creates, and what else in the client's
-Salesforce org is spending the rate limit.
-
-**Contents**
-
-1. [Assumptions, and the questions I would ask](#1-assumptions-and-the-questions-i-would-ask)
-2. [The systems, who calls whom, the network seam, the interfaces](#2-the-systems-who-calls-whom-the-network-seam-the-interfaces)
-3. [The subproblems, in the order I would build them](#3-the-subproblems-in-the-order-i-would-build-them)
-4. [The data we store](#4-the-data-we-store)
-5. [The inbound path: webhook to our database](#5-the-inbound-path-webhook-to-our-database)
-6. [The outbound path: portal edit to Salesforce API call](#6-the-outbound-path-portal-edit-to-salesforce-api-call)
-7. [The rule when both sides change the same record](#7-the-rule-when-both-sides-change-the-same-record)
-8. [The rule for a duplicate webhook, and for an older one arriving after a newer one](#8-the-rule-for-a-duplicate-webhook-and-for-an-older-one-arriving-after-a-newer-one)
-9. [The rule that stops a loop](#9-the-rule-that-stops-a-loop)
-10. [The 6-hour outage: what is on disk, how we drain it, the arithmetic](#10-the-6-hour-outage-what-is-on-disk-how-we-drain-it-the-arithmetic)
-11. [Three numbers I would watch, and when I would call someone](#11-three-numbers-i-would-watch-and-when-i-would-call-someone)
-12. [What I am leaving out of this weekend's work](#12-what-i-am-leaving-out-of-this-weekends-work)
-
-Appendix A: [the exercise's worked scenario, traced](#appendix-a-the-exercises-worked-scenario-traced)
+**Numbers.** Peak 20 edits/s assumed, business-hours average 3, quiet hour 0.5.
+We run at **70 of the 100 req/s** allowed, 11% used in steady state. A 6-hour
+outage queues **19,440 changes → 14,954 calls**, draining in 5.1 min; with the
+1.2-min sweep first, **6.3 min** (row 1, 10.4). The 30-second target closes at
+~6 s both ways, of which 7 of the 9.8 worst-case seconds are Salesforce's.
 
 ---
 
 ## 1. Assumptions, and the questions I would ask
 
-Nothing below was given to me. Each one is an assumption I had to make to close
-the design, followed by one sentence on what I would change if the answer came
-back the other way. The five the exercise names are A1, A3, A4, A7 and A9.
+Nothing below was given. **[Appendix D](#appendix-d-assumption-consequences-and-rejected-alternatives)
+gives what changes if each goes the other way** — required reading beside this
+table. The five the exercise names are A1, A3, A4, A7, A9.
 
-### 1.1 Volume and shape of the traffic
+| | Assumption |
+| --- | --- |
+| **A1** | **Peak 20 edits/s; business-hours average 3/s; quiet hour 0.5/s.** Derived: 5 M records × ~4 touches/yr = 20 M/yr ÷ (250 d × 8 h = 7,200,000 s) = 2.8/s, × 7 peak factor. **10.4 uses the 3/s average — 10.1 says why** |
+| **A2** | 70% of edits originate in Salesforce, 30% in the portal |
+| **A3** | **A webhook carries only the changed fields**, per the sample |
+| **A4** | **Salesforce can be queried for records changed in a window** — SOQL on `SystemModstamp > :watermark`, 2,000 records per request |
+| **A5** | **Creates can be made idempotent** via external-id upsert keyed on our own `portalId` |
+| **A6** | `changedBy` names the API caller, so our integration user is recognisable in it |
+| **A7** | **Delivery is at-least-once**, HTTPS, HMAC-SHA256 over the raw body, retried on 5xx or timeout |
+| **A8** | Throttling arrives as 429 or `REQUEST_LIMIT_EXCEEDED`, with `Retry-After` when available |
+| **A9** | **On a portal save, the time comes from our database** (`clock_timestamp()`) **and the actor from the authenticated session** — not the body's `editedBy`, which a caller could forge |
+| **A10** | Clock skew between Salesforce's clock and ours is at most 2 s |
+| **A11** | `occurredAt` is UTC, millisecond resolution; two edits can share a millisecond |
+| **A12** | The 100 req/s cap is ours alone to spend, and **we run at 70** |
+| **A13** | Salesforce emits a webhook within 5 s p99; a record write returns within 2 s p99 |
+| **A14** | The nine named fields are the whole schema |
+| **A15** | No record is ever deleted (the exercise's scope) |
+| **A16** | **The outage is dark both ways at once** — the brief's two sentences jointly imply it, and it is the harder reading |
 
-**A1 — Peak edit rate is 20 edits/second; the business-hours average is 3
-edits/second; a quiet hour is 0.5 edits/second.**
-Derived rather than guessed: 5 million records touched about four times a year
-is 20 million edits a year; spread over 250 working days of 8 hours
-(7,200,000 seconds) that is 2.8 edits/second average, which I round to 3. A
-peak-to-average factor of 7, which is ordinary for a business application with
-daily, weekly and month-end peaks, gives 20 edits/second sustained over the
-busiest quarter hour. Part 10 uses these numbers.
-The **outage arithmetic in part 10.4 uses the 3/second average, not the peak**,
-and 10.1 says why.
-*If it goes the other way:* at a real peak of 200 edits/second the portal's
-share alone is 60 requests/second and we are close to the cap in steady state,
-so per-record coalescing stops being an optimisation and becomes load-bearing,
-and the 30-second budget needs a debounce per record instead of the flat
-1-second window in part 6.
+**Questions I could not close with an assumption.**
 
-**A2 — 70% of edits originate in Salesforce, 30% in the portal.**
-The sales team is the larger population and touches every record; finance and
-customer-success touch a subset.
-*If it goes the other way:* if the portal is the busier side, steady-state
-outbound traffic roughly doubles to 14 requests/second and the 6-hour backlog grows to
-45,360 queued changes coalescing to 34,892 calls, so catch-up becomes **row 4
-of part 10.4: 12.5 minutes instead of 6.3** — still inside the cap, but it
-consumes most of the headroom I deliberately keep in A12.
-
-**A3 — A webhook carries only the changed fields, as the sample shows.**
-I design for changed-fields-only and I would ask for it, because in a
-full-record payload a field's silence and a field's restatement look identical.
-*If it goes the other way:* part 8.4 gives the full rule — in full-record mode
-I must diff the payload against the last value I attributed to Salesforce
-rather than against our current value, which costs one extra column, because
-otherwise an unchanged field restamped with a new `occurredAt` would overwrite
-a newer portal edit that had not yet reached Salesforce.
-
-### 1.2 Salesforce APIs this note does not give me
-
-These are the three places where I need something the brief does not hand me.
-Each is marked as an assumption in the text that uses it.
-
-**A4 — We can ask Salesforce for records that changed in a time window.**
-I assume a SOQL query over the Salesforce Query API filtering on
-`SystemModstamp > :watermark`, returning up to 2,000 records per request. This
-is how outage recovery works in part 10.
-*If it goes the other way:* **row 6 of part 10.4** — recovery becomes a full
-compare of all 5 million records, 21.8 minutes instead of 6.3, which is cheap
-enough that A4 turns out to be preferable rather than load-bearing. I would run
-that sweep nightly regardless, and push harder for Change Data Capture, which
-would also retire A11.
-
-**A5 — Salesforce creates can be made idempotent with an external-id upsert.**
-I assume a `PATCH /sobjects/{Type}/{ExternalIdField}/{portalId}` upsert against
-an external-id field on Account and Contact, so that retrying a create we are
-unsure about cannot produce a second record. Part 6.4.
-*If it goes the other way:* without an external-id field we must search before
-create on a natural key, which is racy, so every portal-originated create
-becomes a two-call sequence with a duplicate-record risk I would have to accept
-and report on a dashboard.
-
-**A6 — A webhook's `changedBy` identifies the API caller, so our integration
-user is recognisable in it.**
-Part 9's cheap classification rule reads this field.
-*If it goes the other way:* if `changedBy` reports the record's owner rather
-than the caller, rule L2 in part 9 is simply switched off; loop termination is
-unaffected because it rests on rule L1, which is structural, but we lose the
-cheap classification and pay a little more in history noise and repair writes.
-
-### 1.3 The wire between us
-
-**A7 — Webhook delivery is at-least-once, over HTTPS, authenticated with a
-signature over the raw body using a shared secret, and Salesforce retries on a
-5xx or a timeout.**
-The exercise promises duplicates and reordering, which only makes sense with
-retries. I assume nothing about a retry budget.
-*If it goes the other way:* if delivery is at-most-once with no retry, every
-missed webhook becomes permanent divergence, so the recovery sweep of A4 stops
-being outage machinery and has to run continuously as the primary inbound path
-with webhooks as a latency optimisation on top.
-
-**A8 — Salesforce signals rate limiting with HTTP 429 or a
-`REQUEST_LIMIT_EXCEEDED` error, and a `Retry-After` when it has one.**
-Part 6.5 is the slow-down behaviour.
-*If it goes the other way:* if the signal is only a hard rejection with no
-hint, the sender halves its rate on any rejection and probes upward on
-success, which is what it does anyway; only the recovery speed changes.
-
-**A13 — Salesforce's own webhook emission delay is at most 5 seconds at p99,
-and a record API write returns within 2 seconds at p99.**
-These two are the only parts of the 30-second budget we do not control.
-*If it goes the other way:* if Salesforce takes 25 seconds to emit, the
-30-second target is not achievable by any design on our side and that becomes a
-conversation with the client about the number rather than about the system.
-
-### 1.4 Time and identity on our own side
-
-**A9 — On a portal save, the time comes from our database and the actor comes
-from the authenticated session.**
-The sample portal edit has no time field, so there is nothing to trust in the
-payload. The portal save takes the transaction's `clock_timestamp()` at the
-moment it writes, and the actor is the session principal that the portal
-authenticated, not the `editedBy` string in the request body — a client-supplied
-actor is an assertion, and attributing history to it would let a caller forge
-who made a change. `editedBy` is kept as a reported value for comparison.
-*If it goes the other way:* if the portal must honour a client-supplied edit
-time, for instance because an offline mobile client replays saves, then portal
-changes stop being monotonic per record and the duplicate rule of part 8 has to
-be extended to portal saves, which currently cannot duplicate.
-
-**A10 — Clock skew between Salesforce's clock and ours is at most 2 seconds.**
-Part 7 compares a Salesforce-supplied `occurredAt` against a time our own
-database generated, so the two clocks are being compared directly.
-*If it goes the other way:* with unbounded skew the order key stops ordering
-cross-side edits to the same field within the skew window; it still converges
-both copies to the same value, because the comparison is deterministic and both
-sides run it identically, but which value wins becomes arbitrary, so I would
-raise the divergence alert of part 11 to a page and widen it to watch for a
-systematic bias in one direction.
-
-**A11 — `occurredAt` is UTC with millisecond resolution, and two distinct
-Salesforce edits to the same field can share a millisecond.**
-This is why the order key in part 7 has tiebreakers rather than being a bare
-timestamp.
-*If it goes the other way:* if Salesforce exposes a monotonic replay sequence
-instead — Change Data Capture replay ids would do it — the tiebreakers go away
-and the out-of-order rule gets strictly stronger, because we would be able to
-detect a *gap* and not merely order what arrived.
-
-**A12 — The 100 requests/second cap is ours alone to spend, and we choose to
-run at 70.**
-Part 6.5 justifies the 70 both ways: low enough that another consumer in the
-client's Salesforce org cannot push us into rejections, high enough to drain
-the outage backlog inside the window computed in part 10.
-*If it goes the other way:* if the client's org already spends, say, 60
-requests/second on other integrations, our governor drops to 25 and catch-up
-becomes **row 5 of part 10.4: 16.0 minutes instead of 6.3** — the design does
-not change, one configured number does.
-
-### 1.5 Scope assumptions
-
-**A14 — The nine fields named in the exercise are the whole schema, and the set
-is closed.** A tenth field would be configuration, not a code change, because
-nothing in the design is written per field.
-
-**A15 — No record is ever deleted, as the exercise puts deletes out of scope.**
-*If it goes the other way:* a delete is a change whose new value is "gone", and
-it needs a tombstone that survives in history, plus a rule for an edit that
-arrives after a delete — which is the same order-key comparison, so the data
-model in part 4 would carry it, but the portal's reads would all need a
-not-deleted predicate.
-
-**A16 — The 6-hour outage is a two-way blackout.** The brief says the
-Salesforce API is unreachable and separately that webhooks sent during the
-window may never arrive, so I design for both directions being dark at once,
-which is the strictly harder case.
-
-### 1.6 Questions I could not close with an assumption
-
-These would change the design, and I would want them answered before locking
-it. I have put each one where it would land.
-
-1. **How is the webhook actually produced** — an Apex trigger callout, a
-   Platform Event subscription, Change Data Capture, or an external middleware?
-   This decides A4, A6 and A11 together, and Change Data Capture would let me
-   delete a third of part 8. It is the single highest-value question on this
-   list.
-2. **Is there an external-id field on Account and Contact already, and may we
-   write to it?** This is A5, and it is the difference between safe retries and
-   a duplicate-record risk on every portal-originated create.
-3. **What else in the client's Salesforce org consumes the API limit?** This is
-   A12, and it sets one configured number.
-4. **When two portal users edit the same field, what should the second one
-   see?** I have answered it in part 7.5 with the rule I think is right — the
-   save succeeds, the portal re-reads, and the loser is told who overwrote them
-   — but the honest answer is that it is a product decision and I would rather
-   the client made it.
-5. **Does the client need the history to be legally retained, and does that
-   conflict with a right-to-erasure obligation?** Part 4 never deletes a change,
-   and that is a deliberate product commitment that someone should sign off
-   rather than inherit from me.
-6. **Is a record ever intentionally allowed to differ between the two
-   systems** — a field finance owns and sales must not touch, for instance? I
-   have assumed not. If some fields are single-owner, the merge in part 7 gets
-   simpler for them and the design gets a per-field ownership table.
-7. **What should the portal show while a save is still on its way to
-   Salesforce?** I have assumed sync is invisible to the user. If it has to be
-   visible, the outbound queue's state becomes a read model the portal renders,
-   which is a small change made expensive by being discovered late.
+1. **How is the webhook produced** — Apex callout, Platform Event, Change Data
+   Capture, middleware? Decides A4, A6 and A11 together and would let me delete
+   a third of part 8. Highest-value question here.
+2. **Is there an external-id field on Account and Contact we may write?** (A5.)
+3. **What else in the client's org spends the API limit?** (A12, row 5 of 10.4.)
+4. **When two portal users edit one field, what should the second see?** 7.5
+   gives my rule, but it is a product decision.
+5. **Must history be retained legally, and does that conflict with
+   right-to-erasure?** Part 4 never deletes a change; someone should sign that
+   off rather than inherit it from me.
+6. **Is any field single-owner?** I assume not; if some are, part 7 simplifies
+   for them and we need a per-field ownership table.
 
 ---
 
 ## 2. The systems, who calls whom, the network seam, the interfaces
 
-### 2.1 The three parties and the two paths
-
 ```
-   sales user                                finance / customer-success user
-       |                                                    |
-       | edits in                                           | edits in
-       v                                                    v
-+-------------------+                            +-------------------------+
-|   SALESFORCE      |                            |   TEQUITY PORTAL        |
-|   (client's CRM,  |                            |   (our app)             |
-|   their database) |                            |                         |
-+-------------------+                            +-------------------------+
-       |      ^                                        |            |
-       |      |                                        | in-process | in-process
-       |      |                                        v            v
-       |      |                              +------------------------------+
-       |      |                              |  MERGE  (the deep module)    |
-       |      |                              |  order keys, history,        |
-       |      |                              |  echo and repair decisions   |
-       |      |                              +------------------------------+
-       |      |                                     |            ^
-       |      |                                     v            |
-       |      |                              +------------------------------+
-       |      |                              |   POSTGRES  (our database)   |
-       |      |                              |   records, field history,    |
-       |      |                              |   outbound queue, watermark  |
-       |      |                              +------------------------------+
-       |      |                                  ^                |
-       |      |     ==== PUBLIC INTERNET ====    |                | claims rows
-       |      |          the only path           |                v
-       |      |                                  |      +--------------------+
-       |      |   (A) Salesforce calls us        |      |   SYNC WORKER      |
-       +------|------------------------------>  [1] ----+   our process      |
-              |   HTTPS webhook              endpoint   |   rate governor,   |
-              |                                         |   retries, sweep   |
-              |   (B) we call Salesforce                +--------------------+
-              +-----------------------------------------------+
-                  HTTPS Salesforce record API
-                  (create / update / changed-since query)
+   sales user                        finance / customer-success user
+       | edits in                                 | edits in
+       v                                          v
++----------------+                     +---------------------+
+|  SALESFORCE    |                     |  TEQUITY PORTAL     |
+| their CRM + DB |                     |  our app            |
++----------------+                     +---------------------+
+    |        ^                               | in-process
+    |        |                               v
+    |        |                 +-------------------------------+
+    |        |                 | MERGE   order keys, history,  |
+    |        |                 | echo and repair decisions     |
+    |        |                 +-------------------------------+
+    |        |                      |                ^
+    |        |                      v                |
+    |        |                 +-------------------------------+
+    |        |                 | POSTGRES  records, field      |
+    |        |                 | history, outbound queue       |
+    |        |                 +-------------------------------+
+    |        |                     ^                  |
+    |  === PUBLIC INTERNET ===     |                  v
+    |        |  the only path      |          +----------------+
+    |        |                     |          | SYNC WORKER    |
+    |        |  (A) Salesforce->us [EP]-------| governor,      |
+    +--------|-------------------->|          | retries, sweep |
+             |     HTTPS webhook              +----------------+
+             |  (B) us->Salesforce                   |
+             +---------------------------------------+
+                HTTPS record API: create / update / changed-since
 
-  [1] = WEBHOOK ENDPOINT, our process. Validates, dedupes, calls MERGE, commits, returns 200.
+  [EP] WEBHOOK ENDPOINT (ours): validate, dedupe, MERGE, commit, 200.
 ```
 
-Who calls whom, stated plainly:
-
-| Path | Caller | Callee | Trigger | Our cap |
+| Path | Caller | Callee | Trigger | Cap |
 | --- | --- | --- | --- | --- |
-| A | Salesforce | our webhook endpoint | a record changed in Salesforce | none — inbound is outside the cap |
-| B | our sync worker | Salesforce record API | a field's current value changed in our database | 100 req/s hard, we run at 70 (A12) |
-| — | the portal's save handler | MERGE, in-process | a portal user saved the form | not a network call |
+| **A** | Salesforce | our webhook endpoint | a record changed in Salesforce | none — inbound is outside the cap |
+| **B** | our sync worker | Salesforce record API | we believe Salesforce disagrees with us | 100 req/s hard; we run at 70 |
+| — | the portal's save handler | MERGE, in-process | a portal user saved | not a network call |
 
-A sales user never talks to the portal and a portal user never talks to
-Salesforce. Neither human crosses the internet seam; only paths A and B do.
+No human crosses the internet seam; only paths A and B do.
 
-### 2.2 One service or two
+**Two processes, one repository, and the seam between them is Postgres** — not
+HTTP, not a broker ([ADR 0001](adr/0001-two-processes-with-postgres-as-the-seam.md)).
+The endpoint is latency-sensitive and horizontally scalable and must never
+block on Salesforce; the worker is the single governor of a shared cap, so we
+want exactly one. The decisive argument is transactional: the queue must
+survive a restart anyway, and once it is in the same database the inbound apply
+and the outbound enqueue are **one commit**, so "we changed a value" and "we
+owe Salesforce a call" cannot disagree after a crash.
 
-**Two processes, one deployable repository, and the seam between them is
-Postgres, not an HTTP call and not a broker.** The decision record is
-[ADR 0001](adr/0001-two-processes-with-postgres-as-the-seam.md); the short
-version:
-
-- The webhook endpoint is latency-sensitive, spiky, stateless and horizontally
-  scalable. It must return 200 fast and must never block on Salesforce, because
-  a slow Salesforce turning into a 500 from us would make Salesforce retry
-  work that already succeeded.
-- The sync worker is rate-capped and must behave as a single global governor of
-  a shared 100 req/s budget. That is the opposite scaling story: we want
-  exactly one of it, not N.
-- The outbound queue has to survive our process restarting — that is a hard
-  requirement, not a preference — so it is on disk regardless. Once it is on
-  disk in Postgres, the inbound apply and the outbound enqueue can be the
-  **same transaction**, which is the decisive argument: a separate broker would
-  make "we changed a value" and "we owe Salesforce a call" two facts that can
-  disagree after a crash.
-
-**What crosses the boundary between them:** rows, in two tables, in one
-direction each.
-
-| Table | Written by | Read by | Meaning |
+| Crosses the boundary | Written by | Read by | Means |
 | --- | --- | --- | --- |
-| `outbound_change` | endpoint and portal (inside the merge transaction) | sync worker | "a field's current value moved; Salesforce does not know yet" |
-| `echo_fence` | sync worker (after a successful send) | endpoint | "we just wrote this exact value to Salesforce; expect it back" |
+| `outbound_change` | endpoint and portal, in the merge transaction | sync worker | "we believe Salesforce disagrees about this field" |
+| `echo_fence` | sync worker, after a successful send | endpoint | "we just wrote this value; expect it back" |
 
-Nothing else. No RPC, no shared in-memory state, no ordering dependency
-between the two processes beyond what the rows carry.
+**The interface on each side** is in
+[Appendix C.1](#c1-the-interface-on-each-side): our webhook endpoint's contract
+and status codes, the three Salesforce record-API operations we depend on —
+each idempotent **by design**, which is what makes at-least-once sending safe —
+and `applyChanges`, the one interface every edit path goes through. Two facts a
+caller most needs: **a 200 is returned only after our transaction commits**, and
+redelivering an event that got a 200 is harmless.
 
-### 2.3 The interface on each side
+**Seams.** `SalesforceClient` has two real adapters, live HTTPS and the demo's
+fake. Postgres deliberately has none: there will only ever be one, and
+abstracting it would hide the transaction semantics parts 5 and 6 rest on.
 
-Four interfaces matter. For each I give what a caller must know, which in this
-design includes the failure modes and the ordering guarantees, not just the
-shape of the payload.
+**Does 30 seconds close?** Yes, at ~6 s both ways:
 
-**(i) Our webhook endpoint — the interface Salesforce sees.**
+| Portal → Salesforce | p99 | Salesforce → portal | p99 |
+| --- | --- | --- | --- |
+| commit (queue row is in it) | — | Salesforce emits (A13, **not ours**) | 5.0 s |
+| worker notices (`NOTIFY`, 1 s poll fallback) | 1.0 s | network | 0.5 s |
+| coalescing window | 1.0 s | our apply transaction | 0.2 s |
+| queue wait at 11% utilisation | 0.1 s | | |
+| Salesforce write (A13, **not ours**) | 2.0 s | | |
+| **total** | **4.1 s** | **total** | **5.7 s** |
 
-```
-POST /sync/salesforce/webhook
-  X-Signature: hex(hmac-sha256(shared_secret, raw_request_body))     (A7)
-  Content-Type: application/json
-
-  { "eventId":       "evt_1001",                 required, our idempotency key
-    "recordId":      "0031A00000Abc",            required, Salesforce id
-    "objectType":    "Contact" | "Account",      required
-    "occurredAt":    "2026-11-02T11:30:04.000Z", required, UTC ms  (A11)
-    "changedBy":     "sales.user@client.example",required            (A6)
-    "changedFields": { "phone": "+919876543210" } required, >= 1 entry  (A3)
-  }
-
-200 {"status":"applied"|"duplicate"|"echo"|"partially-superseded"}
-    the event is durably accounted for; do not send it again
-400 malformed or unknown objectType / field  — do not retry, it will not improve
-401 signature did not verify                 — do not retry
-429 we are shedding load                     — retry with backoff
-500 we failed unexpectedly                   — please retry; the retry is safe
-```
-
-The two facts a caller most needs: **a 200 is only returned after our
-transaction has committed**, and **re-delivering an event that got a 200 is
-harmless** (part 8). We never return 200 to mean "accepted, will process
-later", because that would make the 200 a lie we cannot recover from.
-
-**(ii) The Salesforce record API — the interface we call.** Exactly three
-operations, which is the entire surface we depend on:
-
-```
-update   PATCH  /services/data/vXX.X/sobjects/{Type}/{sfId}
-                body: { "<SalesforceField>": <value>, ... }   -> 204
-upsert   PATCH  /services/data/vXX.X/sobjects/{Type}/{ExtIdField}/{portalId}
-                body: { ... }                                  -> 201 created | 204 updated   (A5)
-changed  GET    /services/data/vXX.X/query?q=SELECT Id,<fields>,SystemModstamp
-                     FROM {Type} WHERE SystemModstamp > {watermark}
-                     ORDER BY SystemModstamp
-                -> { records: [...], done: bool, nextRecordsUrl }   (A4)
-```
-
-Every one of the three is idempotent, and that is a design requirement rather
-than an observation: `update` sends current values so repeating it converges,
-`upsert` is keyed on our own identifier so repeating it cannot make a second
-record, and `changed` is a read. This is what makes at-least-once sending safe
-in part 6.
-
-**(iii) MERGE — the one interface both edit paths go through.**
-
-```
-applyChanges(input: {
-  record:    { objectType, salesforceId? , portalId? },
-  origin:    "salesforce" | "portal",
-  actor:     ActorId,
-  occurredAt: Instant,              // from the payload if salesforce, from our clock if portal (A9)
-  originEventId: string,            // webhook eventId, or the portal change id
-  changes:   { [field]: rawValue },
-}) : Array<{ field, outcome: "applied"|"superseded"|"echo"|"confirmed"|"restatement",
-             previousValue, newValue, enqueuedOutbound: boolean }>
-```
-
-One function, called from **three** places — the webhook endpoint, the
-portal's save handler, and the outage recovery sweep — carrying everything in
-parts 7 to 9 behind it. Note what is *not* a parameter: whether the payload is
-changed-fields-only or a full record (A3). The merge does not need to know,
-because part 8.4's restatement rule gives the right answer in both cases, and
-a parameter that selects between two behaviours is two interfaces wearing one
-name. Callers must know three things and no more: it must be called
-inside a transaction the caller owns; it takes **one lock per record** — the
-`record_link` row — so every concurrent merge on one record serialises, in
-either direction, with no lock ordering for a caller to get right; and it is
-idempotent in the strict sense that calling it twice with the same
-`originEventId` and `occurredAt` changes nothing the second time.
-
-**(iv) The seam at Salesforce itself.** `SalesforceClient` is the only module
-with a real seam in the sense that something actually varies across it: there
-are two adapters, the live HTTPS client and the fake the demo runs against.
-Deliberately *not* behind a seam: Postgres. There is one adapter and there
-will only ever be one, so abstracting it would buy a hypothetical seam at the
-cost of hiding the transaction semantics that parts 5 and 6 depend on.
-
-### 2.4 Does the 30-second target close?
-
-It does, with about two-thirds of the budget unused, and the parts we do not
-control are the parts that dominate.
-
-**Portal edit -> visible in Salesforce** (path B):
-
-| Step | p99 | Why |
-| --- | --- | --- |
-| portal transaction commits, `outbound_change` row is in it | — | same transaction, no delay |
-| worker notices | 1.0 s | `LISTEN`/`NOTIFY` on commit, with a 1 s poll as the fallback |
-| coalescing window | 1.0 s | part 6.3; deliberate, to batch a multi-field form save |
-| queue wait | 0.1 s | at 7.4 req/s against a 70 req/s governor we are 11% utilised (part 6.5) |
-| Salesforce write | 2.0 s | A13, not ours |
-| **total** | **4.1 s** | **8.1 s if one retry is needed** |
-
-**Salesforce edit -> visible in the portal** (path A):
-
-| Step | p99 | Why |
-| --- | --- | --- |
-| Salesforce emits the webhook | 5.0 s | A13, not ours, and the largest single term |
-| network | 0.5 s | public internet, TLS handshake amortised by keep-alive |
-| our apply transaction | 0.2 s | one dedup insert, one record lock, at most 6 field updates and 6 history appends |
-| **total** | **5.7 s** | |
-
-Both sides land inside 6 seconds at p99 against a 30-second worst case. The
-slack is deliberate: 24 seconds of it is there to absorb A13 being wrong, since
-Salesforce's emission delay and write latency together are 7 of our 9.8
-seconds and neither is something we can fix.
-
-The inbound path has no queue of its own. At A1's peak the endpoint commits 14
-transactions a second, which is nothing for Postgres, and adding an inbound
-queue would add a component and a lag term to buy headroom we do not need. The
-condition for adding one is explicit: **inbound apply p99 above 1 second, or
-sustained commits above 500/second.** Until then, inlining the apply is
-strictly better, and part 3 is the general form of that argument.
+The slack is insurance against A13: 7 of the 9.8 worst-case seconds are
+Salesforce's emission delay and write latency, neither ours to fix. **No
+inbound queue** — at A1's peak the endpoint commits 14 transactions a second.
+What would change that: inbound apply p99 above 1 s, or sustained commits above
+500/s.
 
 ---
 
 ## 3. The subproblems, in the order I would build them
 
-### 3.1 How I ordered them
+**Ordered by risk:** (1) getting it wrong loses data unrecoverably, (2) getting
+it wrong is silent, (3) other code is built on the decision. That puts the
+merge rule first and the backfill last — the opposite of the data's flow, since
+the backfill runs before any sync and is still last, being one-off and
+re-runnable.
 
-Not by difficulty and not by what the dependency graph forces. By risk, where
-risk is these three things in this order:
+| | Subproblem | Why here | Demo |
+| --- | --- | --- | --- |
+| **S1** | decide a field's current value, and keep what it displaced | scores on all three: a wrong merge loses a real edit permanently and silently, and every write path is built on its schema | **yes** — the phone-and-city scenario, both values and full history |
+| **S2** | stop a change going round forever | the only self-amplifying failure: a loop eats the whole cap and stops sync for every record within seconds | **yes** — our own update returns and is not sent back |
+| **S3** | hold outbound work on disk and spend the cap | S1's severity, lower likelihood — a transactional outbox is a known shape, and risk is severity × likelihood | **yes** — a pending call survives a restart with the fake down, then drains; the cap is enforced |
+| **S4** | make inbound delivery safe to repeat and to reorder | cannot be earlier: "older" needs S1's order key. Severe but **detectable** and repairable by replaying from the watermark | **yes** — a duplicate, and an older event after a newer one |
+| **S5** | know which record is which across the systems | a lost create response can make a second Salesforce record: bad, hand-cleaned, but bounded and visible at once | no |
+| **S6** | recover what was missed while a side was dark | sixth to build, **first to ask about** — failure is fixed by re-running, but it rests on A4 | no |
+| **S7** | prove the webhook came from Salesforce | a gate, not a risk; stubbed day one, filled before production | no |
+| **S8** | load the 5 million existing records | one-off, offline, no latency target, re-runnable | no |
 
-1. **Getting it wrong loses data that cannot be recovered.** No retry, no
-   re-sync and no apology fixes a field edit we threw away.
-2. **Getting it wrong is silent.** A failure that announces itself is a
-   different class of problem from one that quietly produces a plausible wrong
-   answer for six months.
-3. **Everything else is built on its decision.** A choice that other code
-   writes against is expensive to revisit, so it should be made while it is
-   still cheap.
+The demo covers **S1–S4 and nothing below** — exactly the four whose failures
+are unrecoverable or silent. S5–S8 fail visibly and are fixed by re-running
+something, so a green demo would say little about them.
 
-Those three put the merge rule first and the backfill last, which is roughly
-the opposite of the order in which the system's data flows — the backfill runs
-before any sync happens, and it is still the last thing I would build, because
-it is one-off, offline and re-runnable.
-
-### 3.2 The subproblems
-
-**S1. Decide what the current value of a field is, and keep what it
-displaced.**
-First because it is the only one that scores on all three criteria. A wrong
-merge rule loses a real edit permanently; it does so silently, because a wrong
-value looks exactly like a right one; and every other write path in the system
-is built against the schema and the comparison this subproblem defines. It is
-also the subproblem the exercise is really about — the phone-and-city scenario
-is a merge question, and everything else is plumbing around the answer.
-
-**S2. Stop a change from going round forever.**
-Second because a loop is the one failure here that amplifies itself. Every
-other bug affects the records it touches; a loop consumes the entire 100 req/s
-budget, which takes the integration down for every record and every user at
-once, and it does so within seconds of being deployed. It ranks above the queue
-because the fix is structural — it is a property of *when outbound work is
-created*, which is a decision inside S1's write path, and retrofitting it means
-revisiting that path.
-
-**S3. Hold outbound work on disk and spend the rate cap.**
-Third. Getting it wrong loses portal edits when our process restarts, which is
-the same severity as S1, but it ranks lower for one reason: it is a
-well-understood pattern with a known shape — a transactional outbox with a
-lease — so the probability of getting it wrong is much lower than the
-probability of getting the merge rule subtly wrong. Risk is severity times
-likelihood, and this is where the likelihood term starts to matter.
-
-**S4. Make inbound delivery safe to repeat and safe to reorder.**
-Fourth, and it cannot be earlier because it is defined in terms of S1's
-comparison — "older" has no meaning until the order key exists. A failure here
-corrupts current values, which is severe, but unlike S1 it is *detectable*: the
-divergence number in part 11 goes up, and the damage is repairable by replaying
-from the watermark. Detectable and repairable is what moves it below the
-first three.
-
-**S5. Know which record is which across the two systems.**
-Fifth. A record created in the portal has no Salesforce identifier yet, and a
-lost create response can produce a second Salesforce record. That is genuinely
-bad — duplicate customer records are cleaned up by hand, by someone's
-colleague — but it is bounded to the records being created, and it is visible
-almost immediately. Bounded and visible is why it sits below the four above it.
-
-**S6. Recover what was missed while a side was dark.**
-Sixth as a thing to *build*, first as a thing to *ask about*. Its failure only
-matters during a rare event and is recoverable by simply running it again,
-which is why it ranks here. But it rests entirely on assumption A4, and if the
-client says there is no changed-since query then the whole inbound design
-changes shape, so the question belongs at the top of the call even though the
-code belongs sixth.
-
-**S7. Prove the webhook came from Salesforce.**
-Seventh by risk and the one place where build order deliberately differs: the
-signature check goes in on day one as a stub and is filled in before anything
-reaches production. It ranks low not because it does not matter but because it
-is a gate rather than a risk — a well-bounded piece of work with a known
-answer, whose failure is a security incident rather than a correctness one, and
-which cannot be gotten subtly wrong in the way S1 can.
-
-**S8. Load the 5 million records that already exist.**
-Last. One-off, offline, no latency target, and fully re-runnable from the
-watermark if it fails halfway. Nothing else depends on its internals. It is
-also the only subproblem whose cost is dominated by local database work rather
-than by the API cap, so it exercises nothing the rest of the design needs
-proven.
-
-### 3.3 Which components each subproblem brings, and which bring none
-
-A component appears here only because a subproblem above needed it. Four of the
-eight need nothing new, which is the point of ordering the work this way.
-
-| Subproblem | What it adds to the running system | Exercised by the demo |
-| --- | --- | --- |
-| S1 | MERGE, `field_version`, `field_change`, the typed tables — the only new module with real depth | **yes** — the phone-and-city scenario, ending with both values and the full history |
-| S2 | the canonicalisation rule and `echo_fence`. **No new process:** loop termination is a property of MERGE | **yes** — our own update returns as a webhook and is not sent back |
-| S3 | `outbound_change`, the SYNC WORKER, the rate governor, `SalesforceClient` — the second process, and the only seam with two adapters | **yes** — a pending call survives a restart while the fake Salesforce is down, then drains; and the cap is enforced |
-| S4 | `inbound_event`, the WEBHOOK ENDPOINT — the first process | **yes** — a duplicate webhook, and an older event arriving after a newer one |
-| S5 | `record_link`. **No new process** | no |
-| S6 | `sync_watermark`, a sweep inside the existing worker. **No new process** | no |
-| S7 | signature middleware in the endpoint. **No new process** | no |
-| S8 | a one-off script. **Nothing** — not part of the running system | no |
-
-The demo exercises **S1 to S4 and nothing below them**, which is deliberate
-rather than convenient: those are exactly the four the risk ordering in 3.1 put
-first, and they are the four whose failures are either unrecoverable or silent.
-S5 to S8 fail visibly and are repairable by re-running something, so a passing
-demo would say less about them.
-
-What I am deliberately *not* adding, each tied to the subproblem that would
-have to exist first to justify it:
-
-- **No message broker.** S3 needs durability, and Postgres gives it without
-  breaking the one-transaction property of ADR 0001.
-- **No inbound queue.** S4's apply is one short transaction at 14 commits a
-  second. Part 2.4 states the number at which I would add one.
-- **No cache in front of Postgres.** Nothing in the design reads hot enough to
-  need it, and a cache between MERGE and its row locks would be actively
-  dangerous.
-- **No per-field ownership table.** That is open question 6; if some fields
-  turn out to be single-owner, S1 gets simpler for those fields, and a table
-  built before the answer would be a guess.
+**Four of the eight add no component.** S1 adds MERGE and the record/history
+tables; S3 adds `outbound_change`, the worker, the governor and
+`SalesforceClient`; S4 adds `inbound_event` and the endpoint; S5 adds
+`record_link`. S2, S6, S7 and S8 add **no process** — termination is a property
+of MERGE, the sweep runs inside the existing worker, the signature check is
+middleware, and the backfill is a script outside the running system.
+Deliberately absent: no broker, no inbound queue, no cache in front of MERGE's
+row locks, no per-field ownership table (open question 6).
 
 ---
 
 ## 4. The data we store
 
-Eight tables. Three hold the client's data, two are the machinery of the two
-paths, and three are small bookkeeping. The organising decision is in
+Eight tables; [Appendix C.2](#c2-schema) has the DDL.
 [ADR 0002](adr/0002-merge-per-field-not-per-record.md): **the unit of sync is a
-field, not a record.**
+field** — forced, since the brief's own scenario has a portal city edit and a
+Salesforce phone edit concurrent with each other, and a record-level comparison
+must discard one, unable to see they touched different fields.
 
-### 4.1 The current values — what the portal reads and writes
-
-Ordinary typed tables, the shape the portal already wants. The sync does not
-impose a schema on the application.
-
-```sql
-CREATE TABLE customer (
-  portal_id     uuid PRIMARY KEY,
-  name          text,
-  status        text,
-  owner         text,
-  updated_at    timestamptz NOT NULL
-);
-
-CREATE TABLE contact (
-  portal_id     uuid PRIMARY KEY,
-  full_name     text,
-  phone         text,          -- stored in canonical form, part 7.3
-  email         text,          -- stored in canonical form
-  city          text,
-  owner         text,
-  customer_id   uuid REFERENCES customer(portal_id),
-  updated_at    timestamptz NOT NULL
-);
-```
-
-Nine syncable fields across the two tables, exactly the nine the exercise
-names (A14). **The current value of a field lives here and nowhere else** —
-that is deliberate, and it is why `field_version` below has no value column.
-Two copies of the current value would be two things that can disagree.
-
-### 4.2 The stamps — which change won, per field
-
-```sql
-CREATE TABLE field_version (
-  object_type      text    NOT NULL,          -- 'Customer' | 'Contact'
-  portal_id        uuid    NOT NULL,
-  field            text    NOT NULL,
-  -- the order key, part 7.2. These three columns ARE the comparison.
-  occurred_at      timestamptz(3) NOT NULL,
-  origin_rank      smallint NOT NULL,          -- salesforce = 1, portal = 0
-  origin_event_id  text    NOT NULL,
-  -- who and where, kept for display without reading history
-  origin           text    NOT NULL,
-  actor            text    NOT NULL,
-  -- what we believe Salesforce currently holds for this field, and when we
-  -- last learned it. Updated by a Salesforce observation AND by our own
-  -- successful send (part 6.4) -- a write of ours is the most recent thing we
-  -- know about Salesforce's state. This pair is the whole basis of the repair
-  -- rule (8.3) and the restatement rule (8.4). Null until either happens.
-  sf_value         text,
-  sf_observed_at   timestamptz(3),
-  PRIMARY KEY (object_type, portal_id, field)
-);
-```
-
-One row per record per field: at A1's scale, 1 million customers at 3 fields
-plus 4 million contacts at 6 fields is **27 million rows**.
-
-This table is a **cache, not a second source of truth.** Every column is
-derivable from `field_change` and `sync_observation` — the stamp is the latest
-applied change for that field, and `sf_value` / `sf_observed_at` come from the
-newest Salesforce-origin row of either, whatever its outcome. It exists for two reasons: the comparison in part 7 becomes one
-indexed point read instead of a sort over history, and it gives us a single row
-to take a lock on, which is how concurrent edits to one field serialise. A
-rebuild procedure from `field_change` is part of the operational runbook, and
-it is the repair for any suspicion that this table is wrong.
-
-### 4.3 The history — what the client is actually buying
-
-```sql
-CREATE TABLE field_change (
-  seq              bigserial,
-  object_type      text    NOT NULL,
-  portal_id        uuid    NOT NULL,
-  field            text    NOT NULL,
-  old_value        text,                       -- canonical form; null on create
-  new_value        text,                       -- canonical form
-  occurred_at      timestamptz(3) NOT NULL,    -- the order key of this change
-  origin_rank      smallint NOT NULL,
-  origin_event_id  text    NOT NULL,
-  origin           text    NOT NULL,
-  actor            text    NOT NULL,
-  outcome          text    NOT NULL CHECK (outcome IN ('applied','superseded')),
-  applied_at       timestamptz NOT NULL DEFAULT clock_timestamp(),
-  PRIMARY KEY (seq, applied_at)
-) PARTITION BY RANGE (applied_at);          -- monthly partitions
-
-CREATE INDEX ON field_change (object_type, portal_id, field, occurred_at DESC);
-```
-
-Append-only. Never updated, never deleted. Two outcomes live here and both are
-permanent:
-
-- **`applied`** — this change became the current value.
-- **`superseded`** — this was a real edit by a real person that lost the
-  order-key comparison. It is kept because the exercise is explicit that the
-  fact of an earlier edit stays on record after a later edit, and dropping it
-  counts as losing a change.
-
-"Who changed the phone, and who changed the city" is one indexed read of this
-table per field.
-
-### 4.4 The operational log — echoes and confirmations, which are not history
-
-```sql
-CREATE TABLE sync_observation (
-  object_type text, portal_id uuid, field text,
-  observed_value text, occurred_at timestamptz(3),
-  origin text, origin_event_id text, actor text,
-  outcome text NOT NULL CHECK (outcome IN ('echo','confirmed')),
-  observed_at timestamptz NOT NULL DEFAULT clock_timestamp()
-) PARTITION BY RANGE (observed_at);         -- monthly partitions, dropped at 90 days
-```
-
-Separate table, and the separation is the point. An **echo** is Salesforce
-telling us about our own write, and a **confirmed** observation is Salesforce
-telling us a value we already hold. Neither is an edit by a person, so neither
-belongs in the client's history — but both are exactly what you want when
-debugging a suspected loop, so they are kept for 90 days and then the whole
-partition is dropped. Mixing them into `field_change` would inflate the
-permanent history by about 30% with rows that are not history and would make
-partition-level pruning impossible, since a partition would hold both the
-permanent and the prunable.
-
-### 4.5 The two paths' machinery
-
-```sql
--- inbound idempotency. Part 8.1.
-CREATE TABLE inbound_event (
-  event_id     text PRIMARY KEY,              -- Salesforce's eventId
-  object_type  text NOT NULL,
-  sf_id        text NOT NULL,
-  occurred_at  timestamptz(3) NOT NULL,
-  payload_hash bytea NOT NULL,                -- sha256 of the raw body
-  outcome      text NOT NULL,                 -- applied | echo | superseded | partial | rejected
-  received_at  timestamptz NOT NULL DEFAULT clock_timestamp()
-);
-CREATE INDEX ON inbound_event (received_at);  -- for the 30-day prune
-
--- the durable outbound queue. Part 6. This is what "pending calls survive a
--- restart" means concretely: these rows are committed with the edit itself.
-CREATE TABLE outbound_change (
-  id              bigserial PRIMARY KEY,
-  object_type     text NOT NULL,
-  portal_id       uuid NOT NULL,
-  field           text NOT NULL,
-  reason          text NOT NULL,              -- 'portal-edit' | 'repair' | 'create' | 'recovery'
-  occurred_at     timestamptz(3) NOT NULL,    -- order key of the change that created this row
-  state           text NOT NULL DEFAULT 'pending',
-                  -- pending | inflight | sent | failed
-  attempts        int  NOT NULL DEFAULT 0,
-  next_attempt_at timestamptz NOT NULL DEFAULT clock_timestamp(),
-  lease_owner     text,
-  lease_until     timestamptz,
-  last_error      text,
-  created_at      timestamptz NOT NULL DEFAULT clock_timestamp(),
-  sent_at         timestamptz
-);
-CREATE INDEX ON outbound_change (state, next_attempt_at)
-  WHERE state IN ('pending','inflight');      -- the claim query's only index
-CREATE INDEX ON outbound_change (object_type, portal_id) WHERE state = 'pending';
-CREATE INDEX ON outbound_change (object_type, portal_id, field, created_at)
-  WHERE reason = 'repair';                    -- the repair breaker's count (part 9.5)
-CREATE UNIQUE INDEX ON outbound_change (object_type, portal_id, field)
-  WHERE state = 'pending';                    -- at most one pending call per field
-```
-
-Note what `outbound_change` does **not** store: the value to send. The sender
-reads the current value at send time (part 6.3), so a row queued three hours
-ago during an outage cannot deliver a value we have since superseded.
-
-### 4.6 The bookkeeping
-
-```sql
--- identity across the two systems. S5. A portal-created record has a
--- portal_id before it has an sf_id.
-CREATE TABLE record_link (
-  object_type text NOT NULL,
-  portal_id   uuid NOT NULL,
-  sf_id       text,                            -- null until Salesforce assigns one
-  linked_at   timestamptz,
-  PRIMARY KEY (object_type, portal_id)
-);
-CREATE UNIQUE INDEX ON record_link (object_type, sf_id) WHERE sf_id IS NOT NULL;
-
--- "we just wrote this to Salesforce; expect to hear about it". Part 9, rule L3.
-CREATE TABLE echo_fence (
-  object_type text NOT NULL, portal_id uuid NOT NULL, field text NOT NULL,
-  value_hash  bytea NOT NULL,                  -- sha256 of the canonical value we sent
-  sent_at     timestamptz NOT NULL DEFAULT clock_timestamp(),
-  expires_at  timestamptz NOT NULL,            -- sent_at + 15 minutes
-  PRIMARY KEY (object_type, portal_id, field, value_hash)
-);
-
--- how far through Salesforce's own change history we are confident. Part 10.
-CREATE TABLE sync_watermark (
-  object_type   text PRIMARY KEY,
-  system_modstamp timestamptz NOT NULL,        -- highest SystemModstamp we have seen (A4)
-  updated_at    timestamptz NOT NULL
-);
-```
-
-### 4.7 Does the storage close?
-
-| Table | Rows | Size | Retention |
-| --- | --- | --- | --- |
-| `customer` + `contact` | 5 M | ~1.2 GB | forever |
-| `field_version` | 27 M | ~5.5 GB with its index | forever, rebuildable |
-| `field_change` | 26 M/year (20 M edits at ~1.3 fields each) | ~5.2 GB/year | **forever** — it is the product |
-| `sync_observation` | ~8 M/year | ~1.4 GB/year | 90 days, ~350 MB live |
-| `inbound_event` | 14 M/year, 1.15 M live | ~104 MB | 30 days |
-| `outbound_change` | ~20 k at the worst moment of an outage | ~5 MB | sent rows pruned at 7 days |
-| `record_link` | 5 M | ~400 MB | forever |
-| `echo_fence` | ~5 k live | negligible | 15 minutes |
-| **first year total** | | **~13 GB** | |
-
-Growth is about 5 GB a year, essentially all of it permanent history. That is
-small enough that keeping history forever is a decision about the product, not
-a decision about the budget — which is the answer I want, because the exercise
-makes history a requirement and I would rather not have to argue about it
-later. The 30-day window on `inbound_event` is worth noting for the same
-reason: duplicate suppression costs 104 MB, so there is no reason to trim the
-window to anything that a Salesforce retry could plausibly outlive.
-
----
-
-## 5. The inbound path: webhook to our database
-
-One HTTP request becomes one Postgres transaction. There is no queue and no
-background step: by the time we answer Salesforce, the change is committed or
-it has not happened at all. Part 2.4 gives the reason and the number at which
-I would revisit it.
-
-### 5.1 The whole path
-
-```
-POST /sync/salesforce/webhook
-  |
-  |-- 1. read the raw body as bytes (the signature covers bytes, not re-serialised JSON)
-  |-- 2. verify X-Signature                              -> 401, no retry   (S7, A7)
-  |-- 3. validate the shape                              -> 400, no retry
-  |         missing eventId / unknown objectType / unknown field /
-  |         unparseable occurredAt / empty changedFields
-  |         Each is a distinct message. A 400 means "this will never work",
-  |         so we must be sure before sending one.
-  v
-BEGIN                                                    -- one transaction, no network calls inside
-  |
-  |-- 4. claim the event                                                    (part 8.1)
-  |      INSERT INTO inbound_event (...) VALUES (...)
-  |        ON CONFLICT (event_id) DO NOTHING RETURNING event_id;
-  |      no row returned -> duplicate -> COMMIT, 200 {"status":"duplicate"}
-  |
-  |-- 5. resolve and lock the record                                        (part 5.2)
-  |      SELECT portal_id FROM record_link
-  |        WHERE object_type = $1 AND sf_id = $2 FOR UPDATE;
-  |      This single lock serialises every merge on this record, inbound and
-  |      portal-side alike. It is the only lock the merge takes.
-  |
-  |-- 6. classify the whole event as echo or not                            (part 9)
-  |      changedBy = integration user?  -> echo
-  |
-  |-- 7. for each field in changedFields:
-  |        value := canonicalise(raw)                                       (part 7.3)
-  |
-  |        (a) learn what Salesforce holds -- unconditionally, before deciding
-  |            anything, and only if this is the newest word we have had:
-  |            if occurredAt > field_version.sf_observed_at or it is null:
-  |                field_version.sf_value      := value
-  |                field_version.sf_observed_at := occurredAt
-  |
-  |        (b) a field whose value equals the sf_value we already held is a
-  |            RESTATEMENT, not a change: skip (c) entirely.      (part 8.4)
-  |            A null sf_value means we have never heard Salesforce's value
-  |            for this field, so the incoming value is a change, not a
-  |            restatement. This runs in both payload shapes -- see 8.4.
-  |
-  |        (c) decide the current value:
-  |            if echo:                                                     (part 9)
-  |                sync_observation('echo')          -- no value change, ever
-  |            else if order_key(incoming) > order_key(stored):             (part 7.2)
-  |                UPDATE customer/contact SET <field> = value
-  |                UPSERT field_version with the new stamp
-  |                INSERT field_change(outcome='applied', old_value, new_value)
-  |            else if value is distinct from the current value:
-  |                INSERT field_change(outcome='superseded')                (part 8.2)
-  |            else:
-  |                sync_observation('confirmed')
-  |
-  |        (d) the one repair condition, checked after every field:         (part 8.3)
-  |            if field_version.sf_value is distinct from the current value:
-  |                INSERT outbound_change(reason='repair')
-  |
-  |-- 8. UPDATE inbound_event SET outcome = <applied|echo|superseded|partial>
-  v
-COMMIT
-  |
-  '-- 200 {"status": ...}      <- sent only after the commit returns
-```
-
-Four properties of this shape are deliberate:
-
-- **The dedup claim and the apply are in one transaction.** If they were not,
-  a crash between them would mark an event processed that we never applied,
-  and Salesforce would never send it again (A7 only promises redelivery while
-  we have not answered 200). This is the single most important line in the
-  path.
-- **No network call happens inside the transaction.** Nothing in here can
-  block on Salesforce, which is what keeps the endpoint's p99 at 200 ms and
-  keeps a Salesforce outage from turning into held Postgres locks.
-- **A field is processed independently of its neighbours.** One field in an
-  event can be applied while another in the same event is superseded; the
-  event's recorded outcome is then `partial`. Treating the event as the unit
-  would mean one stale field dragging a fresh one down with it.
-- **Learning what Salesforce holds is separate from deciding what is true.**
-  Step (a) runs before step (c) and regardless of its outcome, so an event we
-  reject still teaches us Salesforce's state. That separation is what collapses
-  the repair rule into the single condition in step (d), and part 8.3 is why it
-  has to be a single condition.
-- **The 200 is sent after the commit, never before.** We never answer "accepted,
-  will process shortly", because that turns the 200 into a promise we have no
-  durable record of having made.
-
-### 5.2 Resolving the record, including the creates
-
-Step 5 has three cases. The third is the subtle one.
-
-**(a) Known `sf_id`.** Normal path: one indexed lookup, lock, proceed.
-
-**(b) Unknown `sf_id`, and `changedBy` is a human.** A record created in
-Salesforce that we have not seen — either a genuine new create, or one whose
-create webhook we lost. Mint a `portal_id`, insert the `record_link` and an
-empty typed row, and let step 7 apply every field in the payload as a normal
-first write. This is also exactly what outage recovery does for every record
-it finds (part 10.3), so the create path and the recovery path are the same
-code.
-
-**(c) Unknown `sf_id`, and `changedBy` is the integration user (A6).** This is
-the echo of a create *we* made, arriving before we had recorded the Salesforce
-id it returned. The window is real: we send the upsert keyed on our own
-`portal_id` (A5), Salesforce creates the record and emits the webhook, and the
-webhook can beat our own write of `record_link.sf_id`. If we treated this as
-case (b) we would mint a second local record for one real contact.
-
-The rule: **answer `503` with `Retry-After: 5` and apply nothing.** We are
-asking Salesforce to tell us again in a moment, by which time the link exists
-and the event takes case (a) and is then recognised as an echo. This costs one
-redelivery and reuses the retry behaviour of A7 rather than adding a holding
-table or making a Salesforce call inside the transaction. It is bounded: after
-60 seconds of a record staying unresolvable this way we log it loudly, treat it
-as case (b), and let the unique index on `record_link(object_type, sf_id)`
-plus a reconciliation sweep catch the duplicate — a visible, repairable
-outcome rather than a stall.
-
-Narrowing the rule to `changedBy = integration user` matters. The broader
-version — defer whenever a create is in flight — would delay legitimate
-Salesforce-side creates by 5 seconds whenever any create of ours was
-outstanding, which at A1's rate is most of the time, and would spend the
-latency budget to fix a race that only involves our own writes. If A6 turns out
-to be false, this rule is not available and the fallback is the reconciliation
-sweep alone.
-
-### 5.3 What the status codes commit us to
-
-| We return | Salesforce should | Because |
+| Table | Holds | Note |
 | --- | --- | --- |
-| `200` | never send this event again | it is committed; a redelivery is harmless but wasted (part 8.1) |
-| `400` | never send this event again | the payload is wrong in a way time will not fix; it is alerted on our side |
-| `401` | stop and alert a human | our shared secret or theirs is wrong; retrying cannot help |
-| `503` + `Retry-After` | send it again shortly | case (c) above, or we are shedding load |
-| `500` | send it again with backoff | we failed unexpectedly; the retry is safe because of step 4 |
+| `customer`, `contact` | **the current values**, typed, as the portal already wants them | the current value lives **here and nowhere else**; two copies would be two things that can disagree |
+| `field_version` | the **order key** per `(record, field)`, plus `sf_value` / `sf_observed_at` | a **cache, not a second truth** — derivable from the logs below, and a rebuild is the repair for any doubt. Also the row MERGE locks |
+| `field_change` | **the history**: append-only, `applied` and `superseded`, both **permanent** | what the client is buying. `superseded` is kept because the brief says the fact of an earlier edit stays on record |
+| `sync_observation` | `echo` and `confirmed` observations, 90-day partitions | neither is an edit by a person, so neither is history; mixing them in would inflate permanent history ~30% and defeat partition pruning |
+| `inbound_event` | the duplicate key, 30-day retention (104 MB) | 8.1 |
+| `outbound_change` | the **durable queue** — which field is owed, **never the value** | so a row queued three hours into an outage cannot deliver a value we have since superseded (6.3) |
+| `record_link` | Salesforce id ↔ portal id, and the per-record lock | a portal-created record has a `portal_id` before an `sf_id` |
+| `echo_fence`, `sync_watermark` | "we just wrote this" (15-min TTL); how far through Salesforce's history we are sure | 9.3, 10.3 |
 
-The asymmetry between 400 and 500 is the one to get right. A 400 throws the
-event away forever, so it is only for payloads that are definitely malformed —
-an unknown field name is a 400, but an unexpected *value* in a known field is
-not, because a value we cannot canonicalise is our bug and deserves a 500 and
-a retry.
+**Does the storage close?** 5 M typed rows at 1.2 GB; **27 M** `field_version`
+rows (1 M customers × 3 fields + 4 M contacts × 6) at 5.5 GB with its index;
+`field_change` at **26 M rows/year** (20 M edits × 1.3 fields) and **5.2 GB/yr,
+kept forever because it is the product**; everything else under 1 GB.
+**~13 GB in year one, growing 5 GB/yr** — almost entirely permanent history,
+which makes keeping it a product decision rather than a budget one.
 
 ---
 
-## 6. The outbound path: portal edit to Salesforce API call
+## 5. The inbound path
+
+**One HTTP request becomes one Postgres transaction**, with no network call
+inside it and no background step. The sequence is
+[Appendix C.3](#c3-the-inbound-apply-one-transaction): validate, claim the
+`eventId`, lock the record, then per field **learn → decide → repair**, then
+commit and answer 200.
+
+Four properties are deliberate:
+
+- **The duplicate claim and the apply share one transaction.** Split them and a
+  crash between marks an event processed that was never applied — and
+  Salesforce will never resend it, since A7 only promises redelivery while we
+  have not answered 200. The most important line in the path.
+- **No network call is inside it**, which keeps the endpoint's p99 at 200 ms
+  and stops a Salesforce outage becoming held Postgres locks.
+- **Fields are independent**: one event may apply `phone` and supersede `city`,
+  and the event's outcome is then `partial`.
+- **Learning is separate from deciding.** Step (a) records what Salesforce
+  holds before step (c) decides anything, and regardless of what it decides, so
+  an event we reject still teaches us Salesforce's state — which is what
+  collapses repair into the single condition 8.3.
+
+**Resolving the record, including creates:**
+
+| Case | Rule |
+| --- | --- |
+| **(a)** known `sf_id` | one indexed lookup, lock, proceed |
+| **(b)** unknown `sf_id`, `changedBy` a human | a Salesforce-created record we have not seen: mint a `portal_id`, insert the link and an empty row, apply every field as a first write. **Recovery (10.3) reuses this path** |
+| **(c)** unknown `sf_id`, `changedBy` the integration user | the echo of a create *we* made, arriving before we recorded the id it returned. **Answer 503 + `Retry-After: 5`, apply nothing** — by the redelivery the link exists and it becomes case (a). Bounded: after 60 s log loudly, treat as (b), and let the unique index plus a reconciliation sweep catch the duplicate |
+
+Treating (c) as (b) would mint a second local record for one real contact.
+Narrowing it to the integration user matters: deferring whenever *any* create
+is in flight would delay legitimate Salesforce creates by 5 s most of the time
+at A1's rate, to fix a race that only involves our own writes.
+
+**400 versus 500** is the pair to get right, since a 400 discards the event
+forever: an unknown *field name* earns one, a *value* we failed to canonicalise
+does not — that is our bug and deserves a 500 and a retry.
+
+---
+
+## 6. The outbound path
 
 ### 6.1 The portal save
 
-The portal's save handler does one transaction, and the queue row is inside it:
+The handler takes the same record lock as part 5, stamps `occurredAt` from
+`clock_timestamp()` and the actor from the authenticated session (A9), calls
+`applyChanges`, and commits. **The value change and the obligation to tell
+Salesforce are the same commit:** die after it and the row is on disk, die
+before and the edit did not happen and the user is told. There is no third
+outcome — that is what ADR 0001 bought.
 
-```
-BEGIN
-  SELECT portal_id FROM record_link
-    WHERE object_type=$1 AND portal_id=$2 FOR UPDATE;   -- the same single lock as part 5
-  occurredAt := clock_timestamp()                        -- our clock, our record (A9)
-  actor      := session.principal                        -- NOT the editedBy in the body (A9)
-  applyChanges({ origin: 'portal', occurredAt, actor, changes, ... })
-      -- for each field that actually moved:
-      --   UPDATE customer/contact SET <field> = canonical
-      --   UPSERT field_version, INSERT field_change(outcome='applied')
-      -- then, per field, the same condition (d) the inbound path uses:
-      --   if sf_value is distinct from the current value:
-      --       INSERT outbound_change(reason='portal-edit')
-COMMIT
-NOTIFY outbound_ready
-```
-
-The one thing to see here: **the value change and the obligation to tell
-Salesforce are the same commit.** If the process dies immediately after
-`COMMIT`, the row is on disk and the call will happen. If it dies before, the
-edit did not happen and the user is told so. There is no third outcome, and
-that is what ADR 0001 bought.
-
-Note what creates a row: **condition (d) of part 5.1, the same one the inbound
-path uses** — we owe Salesforce a call exactly when we believe its value for a
-field differs from ours. A portal save that re-submits the same city moves
-nothing and creates no row; a portal save that happens to set a field to the
-value Salesforce already holds creates no row either. That is not an
-optimisation, it is rule L1 of part 9, and it is why loops cannot run.
+What creates a queue row is **condition 8.3, the same one the inbound path
+uses**, so a save re-submitting the same city creates nothing, and a save that
+happens to set the value Salesforce already holds creates nothing either.
 
 ### 6.2 The worker loop
 
-```
-every tick (on NOTIFY, or every 1 second as a fallback):
-
-  0. hold the leader lease                            (ADR 0003)
-     SELECT pg_try_advisory_lock(SENDER_LOCK_ID);  -- not held -> idle as standby
-
-  1. reclaim anything a dead process left behind      (6.6)
-     UPDATE outbound_change SET state='pending', lease_owner=NULL, lease_until=NULL
-      WHERE state='inflight' AND lease_until < clock_timestamp();
-
-  2. if the circuit breaker is open, probe instead of claiming   (6.5)
-
-  3. claim a batch, whole records at a time           (6.3)
-     WITH due AS (
-       SELECT object_type, portal_id, MIN(next_attempt_at) AS due
-         FROM outbound_change
-        WHERE state='pending' AND next_attempt_at <= clock_timestamp()
-        GROUP BY object_type, portal_id
-        ORDER BY due                      -- oldest-due record first: no starvation
-        LIMIT 200
-     ), picked AS (
-       SELECT o.id FROM outbound_change o JOIN due USING (object_type, portal_id)
-        WHERE o.state='pending' AND o.next_attempt_at <= clock_timestamp()
-        FOR UPDATE SKIP LOCKED
-     )
-     UPDATE outbound_change o
-        SET state='inflight', lease_owner=$me,
-            lease_until=clock_timestamp() + interval '30 seconds',
-            attempts = o.attempts + 1
-       FROM picked p WHERE o.id = p.id
-     RETURNING o.*;
-
-  4. group the claimed rows by (object_type, portal_id)
-  5. for each group: read the CURRENT values of those fields, build one call   (6.3)
-  6. governor.acquire(1 token)  -- every request, retries included            (6.5)
-  7. send; settle the whole group by the outcome                              (6.7)
-```
-
-`attempts` is incremented when a row is **claimed**, not when it fails. A row
-that crashes the process mid-send therefore still counts, which is what stops a
-single poison row from crashing us in a loop forever. Section 6.5 explains the
-one case where the increment is given back.
+[Appendix C.4](#c4-the-outbound-worker-loop) has it. Each tick: hold the leader
+lease (else idle as a standby, [ADR 0003](adr/0003-one-sender-with-a-leader-lease.md));
+reclaim rows whose 30-second lease expired; probe instead of claiming if the
+breaker is open; claim **whole records**, oldest-due first so nothing starves;
+read current values and build one call per record; take a governor token; send
+and settle. `attempts` rises when a row is **claimed**, not when it fails, so a
+row that crashes us mid-send still counts and cannot be retried forever.
 
 ### 6.3 Coalescing, and reading the value late
 
-The claim takes **whole records**: up to 200 distinct records, and every
-pending row belonging to them. All the fields owed on one record become **one**
-Salesforce call. A form save that changed four fields is four queue rows and one
-PATCH.
+All fields owed on one record become **one** call — a four-field form save is
+four rows and one PATCH.
 
-Then the part that matters more than the batching:
+> The sender reads each field's **current value at send time**, never a value
+> carried on the queue row, which is why part 4 stores none.
 
-> The sender reads each field's **current value at send time**, from the typed
-> table. It never sends a value carried on the queue row — which is why part 4.5
-> does not store one.
+A city edit at 09:00 and another at 11:00 during an outage send **the 11:00
+value, once**. Sending the queued values in order would mean two calls and a
+window where Salesforce holds a value we superseded four hours earlier. The
+cost: the queue is a claim ticket, not a message log — `field_change` is that
+log, and a better one.
 
-Consider a 6-hour outage. A city edit at 09:00 and another at 11:00 leave two
-queue rows. When the link comes back at 15:00 we send **the 11:00 value, once**.
-Sending the queued values in order would mean two calls, double the drain cost,
-and a window during which Salesforce holds a value we superseded four hours
-ago. The same property makes the repair writes of part 8.3 safe: a repair row
-written at 09:00 sends whatever we currently believe, not what we believed then.
+On a `2xx`, **after** the response and never before, the sender sets `sf_value`
+and `sf_observed_at` to what it sent — *our own write is the most recent thing
+we know about Salesforce's state* — writes the `echo_fence` rows, and records
+`sent_at`. Appendix B traces the silent divergence that first step prevents.
 
-The cost is that the queue row is a *claim ticket* rather than a message, so
-the queue cannot be read as a log of what we sent. `field_change` is that log,
-and it is a better one.
+### 6.4 The cap, slowing down, and the breaker
 
-### 6.4 The calls, and why each is safe to repeat
+**70 of the 100 req/s,** both bounds chosen. *Not 100:* the cap counts our
+retries and belongs to the client's org, so another integration's burst would
+reach us as rejections, while at 70 a 30% burst is absorbed. *Not lower:*
+catch-up scales inversely — row 1 of 10.4 drains in 6.3 min, row 5 at a
+governor of 25 takes 16.0. Steady state spends ~7.4 req/s, so we run at **11%
+utilisation** and the other 89% drains backlogs. One process suffices: 70 req/s
+at a 2 s p99 is **140 requests in flight** by Little's law.
 
-| Case | Call | Idempotent because |
-| --- | --- | --- |
-| update an existing record | `PATCH /sobjects/{Type}/{sfId}` with current values | sending the same current values twice reaches the same state |
-| record created in the portal | `PATCH /sobjects/{Type}/{ExtIdField}/{portalId}` (A5) | keyed on **our** identifier, so a repeat updates the record it created rather than making a second one |
-| outage recovery read | `GET /query?q=... SystemModstamp > watermark` (A4) | a read |
-
-At-least-once delivery is the only thing a durable queue can honestly offer,
-so every call we make is built to be repeatable. That is why A5 is worth
-pushing for: without an external-id upsert, create is the one operation whose
-repeat is not safe, and the fallback (search, then create) is racy.
-
-On a `2xx` the sender does three things, in this order, then marks the group
-`sent`:
-
-1. sets `sf_value` to the value it sent and `sf_observed_at` to the time of the
-   response, because **our own successful write is the most recent thing we
-   know about Salesforce's state** — more recent than any webhook describing an
-   edit that happened before it;
-2. writes the `echo_fence` rows for the fields it sent;
-3. records `sent_at`.
-
-All three happen **after** the response, never before: a fence or an `sf_value`
-for a call that did not land would suppress a real Salesforce change.
-
-Step 1 is not bookkeeping. Appendix B traces the race it exists for, in which
-leaving `sf_value` untouched on send leaves the two copies permanently
-different with nothing in the system reporting it.
-
-### 6.5 The rate cap, and slowing down without losing work
-
-**We run at 70 requests/second against the 100 the cap allows.** Both bounds
-are chosen, not inherited:
-
-- *Why not 100.* The cap counts our retries (the exercise is explicit), and it
-  is a property of the client's Salesforce org rather than of us, so anything
-  else in that org — another integration, a Data Loader job, a report —
-  competes with us. At 100 we would discover that by being rejected; at 70 a
-  30% burst from someone else is absorbed. A12 is the assumption behind this,
-  and it is the number I would most like confirmed.
-- *Why not lower.* Catch-up after the outage scales inversely with it. Row 1
-  of part 10.4 drains the 6-hour backlog in 6.3 minutes; at a governor of 25
-  that becomes 16.0 (row 5).
-
-The governor is a token bucket: capacity 70, refill 70/second, one token per
-HTTP request **including every retry**. Steady state at A1 and A2 spends about
-7.4 tokens/second, so we run at roughly 11% utilisation and the remaining 89%
-is what drains a backlog.
-
-Throughput is reachable from one process: at 70 requests/second and a 2-second
-p99 (A13), Little's law gives 70 × 2 = **140 requests in flight**, which one
-Node process with a keep-alive pool handles without strain. Steady state needs
-about 15. There is no throughput reason to want a second sender, which is the
-other half of ADR 0003.
-
-**On a slow-down signal** (A8) — HTTP 429, or `REQUEST_LIMIT_EXCEEDED`:
+**On a slow-down signal** (A8), nothing is dropped:
 
 ```
-rate := max(5, rate / 2)                 -- multiplicative decrease
+rate := max(5, rate / 2)                   -- multiplicative decrease
 row.state := 'pending'
-row.next_attempt_at := now + (Retry-After, or 2^attempts seconds with jitter, capped at 300s)
-row.attempts := attempts - 1             -- give the attempt back: this was not the row's fault
-recover: rate := min(70, rate + 5) every 30 seconds of clean responses
+row.next_attempt_at := now + (Retry-After, else 2^attempts s with jitter, cap 300 s)
+row.attempts := attempts - 1               -- given back: not the row's fault
+recover: rate := min(70, rate + 5) per 30 s of clean responses
 ```
 
-Nothing is dropped. The work goes back to `pending` with a later due time, and
-the only thing that changed is how fast we are willing to spend the cap. The
-additive recovery is deliberately slower than the halving, so that a
-rate-limited period does not oscillate.
+**The breaker is what makes a 6-hour outage survivable.** An **endpoint
+failure** (refused, timeout, 5xx) says nothing about the row: after 5
+consecutive ones we stop claiming and probe once every 30 s; claimed rows
+return to `pending` **with attempts restored**; on close we resume at half rate
+and ramp. A **row failure** — a 400-class rejection naming this record's data —
+is the only kind counting attempts toward giving up. Without the split a
+6-hour outage destroys its own backlog: 10 attempts at a 5-minute cap is under
+an hour, so every row would be `failed` by hour two.
 
-**The circuit breaker, which is what makes a 6-hour outage survivable.** The
-sender distinguishes two kinds of failure:
+### 6.5 Restart, and settling a group
 
-- An **endpoint failure** — connection refused, timeout, or 5xx — says nothing
-  about the row. After 5 consecutive ones the breaker opens: we stop claiming
-  entirely and send a single probe every 30 seconds. Rows already claimed go
-  back to `pending` **with their `attempts` restored**, and on close we resume
-  at half rate and ramp up.
-- A **row failure** — a 400-class rejection naming this record's data — is
-  about the row, and only this kind counts attempts toward giving up.
-
-Without that distinction a 6-hour outage would destroy its own backlog: 10
-attempts at a backoff capped at 5 minutes is under an hour, so every row would
-have been marked `failed` by the second hour of the outage. Separating the two
-is the difference between a backlog that waits and a backlog that dies.
-
-### 6.6 What a restart does
-
-Nothing that needs attention. The sequence:
-
-1. The new process acquires the advisory lock (or idles as a standby if
-   another holds it).
-2. Step 1 of the loop returns every row the dead process left `inflight` whose
-   30-second lease has expired. No manual intervention, no reconciliation
-   script.
-3. Sending resumes. Any row that had actually reached Salesforce before the
-   crash is sent again, and 6.4 is why that is safe.
-
-The 30-second lease is the one tuning choice: long enough that a slow call is
-not stolen from a live sender, short enough that a crash costs at most 30
-seconds of delay on the affected rows.
-
-### 6.7 Settling a group
+A restart is a non-event: the new process takes the lease, reclaims rows whose
+lease expired, and resumes. A row that reached Salesforce before the crash is
+sent again, which is safe because all three calls are idempotent (C.1).
 
 | Outcome | State | Attempts | Then |
 | --- | --- | --- | --- |
-| `2xx` | `sent` | — | set `sf_value` / `sf_observed_at` to what we sent; write `echo_fence` rows; record `sent_at` |
-| `429` / limit exceeded | `pending` | restored | halve the rate; honour `Retry-After` |
-| timeout, connection error, `5xx` | `pending` | restored | count toward the breaker; backoff with jitter |
-| `400`-class, data rejected | `failed` | kept | **alert.** A value the portal accepts and Salesforce refuses is a schema disagreement a human must settle |
-| `404`, record gone | `failed` | kept | **alert.** Deletes are out of scope (A15), so this is unexpected by definition |
-| `401` / `403` | `pending` | restored | **page, and stop the sender.** Bad credentials would otherwise burn the whole queue into `failed` |
+| `2xx` | `sent` | — | set `sf_value`/`sf_observed_at`; write `echo_fence`; record `sent_at` |
+| `429` / limit | `pending` | restored | halve the rate; honour `Retry-After` |
+| timeout / refused / `5xx` | `pending` | restored | counts toward the breaker; backoff with jitter |
+| `400`-class, data rejected | `failed` | kept | **alert** — a value the portal accepts and Salesforce refuses needs a human |
+| `404`, record gone | `failed` | kept | **alert** — deletes are out of scope (A15), so this is unexpected by definition |
+| `401` / `403` | `pending` | restored | **page, stop the sender** — bad credentials would otherwise burn the queue into `failed` |
 
-A `failed` row is never deleted. It stays with its `last_error` as the queue's
-own record that something needs a person, and part 11's third number is how we
-find out.
+A `failed` row is never deleted; it keeps its `last_error` as the record that
+something needs a person.
 
 ---
 
 ## 7. The rule when both sides change the same record
 
-### 7.1 First, who is doing the merging
+### 7.1 Who is doing the merging
 
-This is not two peers reconciling. **Salesforce has no merge logic at all** —
-it takes whatever write arrives last and overwrites. We are the only party
-that compares anything. Three consequences follow, and they shape everything
-below:
-
-1. **Our database holds the merge decision.** The current value of a field is
-   what our comparison says it is.
-2. **Salesforce's copy is a projection of that decision**, kept in step by the
-   outbound path. It is not an input to the decision except as the content of
-   the webhooks it sends us.
-3. **Therefore, any time our decision differs from what we believe Salesforce
-   holds, we owe Salesforce a call.** A rejected webhook is not a no-op. It is
-   the discovery of a disagreement, and part 8.3 makes it a repair write.
-
-Point 3 is the one that is easy to miss, and leaving it out is how a design
-that looks correct converges to a permanently wrong Salesforce record.
+**Salesforce has no merge logic** — it overwrites with whatever lands last. We
+are the only party that compares anything, so our database holds the decision
+and Salesforce's copy is a projection of it. Hence the rule that is easy to
+miss: **a webhook we reject is not a no-op.** It is the discovery that
+Salesforce holds a value we rejected, and since nobody else will fix that, it
+owes an outbound call (8.3). Leaving that out is how a design that looks
+correct leaves Salesforce permanently wrong.
 
 ### 7.2 The order key — the field that decides which edit is current
 
-**Named exactly, as the exercise asks.** The current value of a field is the
-value of the change with the greatest **order key**, which is this triple
-compared left to right:
-
-```
-order_key = ( occurred_at , origin_rank , origin_event_id )
-```
-
 | Component | On a webhook | On a portal save |
 | --- | --- | --- |
-| `occurred_at` | **the payload's `occurredAt`** — the time Salesforce gives the event | **`clock_timestamp()` of the saving transaction**, taken in our database at the moment it writes (A9) |
+| `occurred_at` | **the payload's `occurredAt`** | **`clock_timestamp()` of the saving transaction**, from our database as it writes (A9) |
 | `origin_rank` | `1` | `0` |
-| `origin_event_id` | **the payload's `eventId`** | the portal change id, a ULID minted per save |
-
-Stored in `field_version` as exactly those three columns (part 4.2). The rule:
+| `origin_event_id` | **the payload's `eventId`** | the portal change id, a ULID per save |
 
 > **Apply the incoming change if and only if its order key is strictly greater
 > than the stored one.**
 
-Three things about that triple:
+`clock_timestamp()` not `now()`, which returns the transaction's start. On an
+exact tie Salesforce wins, the cheaper direction, since a losing Salesforce
+value owes a repair write and a losing portal value owes nothing; a shared
+millisecond (A11) then breaks on `origin_event_id`, arbitrarily but **stably**,
+which matters because redelivered events must rank the same way twice.
+Strictness is load-bearing: `>` and not `>=` makes re-applying an applied
+change a no-op, so the inbound path is idempotent independently of the
+duplicate table (8.1).
 
-- **Why `clock_timestamp()` and not the request body.** The sample portal edit
-  has no time field, so there is nothing in it to trust; and a client-supplied
-  time, like the client-supplied `editedBy`, is an assertion a caller could
-  forge. Our database generates both the time and — from the authenticated
-  session — the actor. `clock_timestamp()` rather than `now()` because `now()`
-  returns the transaction's start time, so two saves in one transaction would
-  tie needlessly.
-- **Why Salesforce wins an exact tie** (`origin_rank` 1 beats 0). Not
-  arbitrary: it is the cheaper direction. If a portal value loses to an
-  incoming Salesforce change we apply it and owe nothing, whereas if the
-  Salesforce change loses we owe a repair write. Preferring Salesforce on an
-  exact-millisecond tie therefore saves rate-limit budget and costs nothing,
-  since a tie means we have no real information about which came first.
-- **Why `origin_event_id` last.** Two distinct Salesforce edits to one field
-  can share a millisecond (A11). Comparing event ids lexicographically is
-  arbitrary but **total and stable**, which is the property that matters: the
-  same pair evaluated twice — which happens, because webhooks are redelivered
-  — always gives the same answer.
+### 7.3 Canonical form
 
-The strictness of the comparison is load-bearing. Because it is `>` and not
-`>=`, re-applying a change we have already applied does nothing, which makes
-the whole inbound path idempotent independently of the duplicate table. Part
-8.1 relies on that.
-
-### 7.3 Canonical form, which is what makes the rest true
-
-Values are canonicalised **before** they are compared or stored, and the stored
-form is the canonical one.
+Canonicalised **before** being compared or stored; the stored form is canonical.
 
 | Field | Canonical form |
 | --- | --- |
 | all text | Unicode NFC; trim; collapse internal whitespace runs to one space |
-| `email` | the above, then lowercased whole (we accept that the local part is case-sensitive in the RFC and case-insensitive in practice at every provider the client uses — an assumption worth one question) |
-| `phone` | E.164, using the contact's country; if parsing fails, keep digits with a leading `+` and raise the parse-failure counter |
-| `status` | mapped through the agreed picklist vocabulary, so our value and the Salesforce picklist label are one value |
+| `email` | the above, then lowercased whole |
+| `phone` | E.164 by the contact's country; on a parse failure, digits with a leading `+`, and raise the parse-failure counter |
+| `status` | mapped through the agreed picklist vocabulary |
 | `customer_id` | the `portal_id` UUID, lowercase hex |
-| empty | `''` and `NULL` are one thing, stored as `NULL` |
+| empty | `''` and `NULL` are one thing, stored `NULL` |
 
-This looks like hygiene and it is not. It is what makes part 9's loop rule
-true, and the failure without it is concrete: the portal sets a phone to
-`+919876543210`, we send it, Salesforce stores and reformats it as
-`+91 98765 43210`, and the webhook comes back. Compared raw, that is a
-*different* value with a *later* time, so we would apply it — our value
-changes, which creates outbound work, which Salesforce echoes again. One
-reformatting difference between the two systems is enough to turn the sync into
-a generator of its own traffic. Canonical comparison makes the two spellings
-one value, and the echo becomes the no-op it should always have been.
+Not hygiene — this is what makes 9.1 true. Send `+919876543210`, let Salesforce
+store `+91 98765 43210`, and the echo reads as a different value with a later
+time: we apply it, our value changes, that creates outbound work, which echoes
+again. One formatting difference turns the sync into a generator of its own
+traffic.
 
-### 7.4 Both sides change the same record, different fields
+### 7.4 Different fields — the brief's own scenario
 
-This is the exercise's own scenario and it needs no conflict rule at all,
-which is the entire argument for ADR 0002. The comparison is per field and the
-lock is per record, so:
+No conflict rule needed, which is the argument for ADR 0002. Finance sets
+`city`; `phone` is untouched. Sales changes `phone`; the webhook names `phone`
+only (A3), so `city` is never looked at. The portal ends with the new phone
+**and** the finance city, each with its own actor and time. Appendix A traces
+it with the echo in place.
 
-- Finance sets `city` in the portal. `field_version[city]` gets a portal
-  stamp. `phone` is untouched.
-- Sales changes `phone` in Salesforce. The webhook names `phone` only (A3), so
-  only `field_version[phone]` is compared and only `phone` moves. `city` is
-  never looked at, let alone overwritten.
-- The portal ends with the new phone and the finance city, and
-  `field_change` holds one `applied` row for each, with its own actor and time.
+### 7.5 The same field
 
-Appendix A traces it step by step with the echo in place.
+**Across the two sides:** the order key decides; the winner gets an `applied`
+row; **the loser is kept** as `superseded` with its value, actor and time (the
+brief is explicit that the fact of an earlier edit stays on record); and **if
+the loser was Salesforce's value, a repair write is enqueued** (8.3).
 
-### 7.5 Both sides change the same field
-
-**Across the two sides.** The order key decides. Then, and this is the half
-that is not optional:
-
-- The winner becomes the current value. `field_change` gets an `applied` row.
-- **The loser is kept** — `field_change` gets a `superseded` row with its real
-  value, actor and time, because the exercise is explicit that the fact of an
-  earlier edit stays on record and that dropping it counts as losing a change.
-- **If the loser was Salesforce's value, a repair write is enqueued** (part
-  8.3), because of point 3 in 7.1: Salesforce now holds a value we have
-  rejected, and nobody but us will fix that.
-
-**Two portal users, same field** — the exercise asks this one directly. The
-record lock of part 5.1 means the two saves do not actually overlap; they
-serialise, so there is a first and a second rather than a tie. The second save
-wins on the order key, having a later `clock_timestamp()`.
-
-- *The second user:* their save succeeds, normally.
-- *The first user:* their value is in `field_change` as the value they set,
-  with their name, and then as the `old_value` of the change that replaced it.
-  Nothing is lost.
-- *What they **see*** is a product decision, and my rule is this: after a save
-  the portal re-reads the record and renders each field with its current value
-  and "set by X at T"; if what the user submitted is not the current value, it
-  shows an inline notice naming who replaced it. We do **not** block the save
-  and we do **not** show a merge dialog — the write already happened and the
-  user's intent is already recorded, so the honest thing is to make the
-  overwrite visible rather than to pretend it can be prevented. This is open
-  question 4 and I would rather the client chose.
-- *What goes to Salesforce:* in the sequential case both saves are real
-  transitions, so both create queue rows. Coalescing (part 6.3) collapses them
-  inside the 1-second window into one call carrying the current value; outside
-  it, two calls land in order and the second wins. Both are correct because the
-  sender reads the current value at send time.
-
-**How often does this actually happen?** Worth knowing, because it decides how
-much the rule matters. At A1's average of 3 edits/second over 27 million field
-slots, two edits landing on the same field inside the 6-second visibility
-window is, if edits were spread uniformly, about one event every two to three
-weeks (18 edits in a window, 18/27,000,000 per edit, over 86,400 edits a day).
-Edits are not uniform — they cluster on recently created and actively worked
-records — so I would assume one or two a day in reality and I would measure it
-with part 11's third number. Either way it is rare enough that getting the rule
-*right* matters much more than making it fast, which is why part 5 spends a
-record-level lock on it without hesitating.
+**Two portal users, same field** (the exercise asks directly). The record lock
+makes the saves serialise rather than tie, so the second wins on a later
+`clock_timestamp()` and its save succeeds normally. The first user's value is
+in `field_change` under their name and as the `old_value` of what replaced it,
+so nothing is lost. What they *see* is a product decision (open question 4); my
+rule is that the portal re-reads after a save, renders each field with "set by
+X at T", and shows an inline notice naming who replaced a value the user
+submitted — **no blocking and no merge dialog**, because the write already
+happened and the intent is already recorded, so the honest thing is to make the
+overwrite visible rather than pretend it can be prevented. To Salesforce, both
+saves are transitions, so coalescing sends the current value once inside the
+1-second window, or two calls land in order outside it; both are correct
+because the sender reads the current value at send time.
 
 ### 7.6 Two clocks: the rule for the skew window
 
-A webhook's `occurred_at` is Salesforce's clock and a portal save's is ours, so
-7.2 compares two clocks. Inside the skew window (A10: 2 seconds) an edit
-genuinely made second can rank first.
-
-**The rule: the order key stays authoritative inside the window. We do not
-detect or correct an inversion. We bound the skew, and we measure and page on
-the inversions.**
+7.2 compares Salesforce's clock against ours, so inside the skew window (A10:
+2 s) an edit made second can rank first. **The rule: the order key stays
+authoritative inside the window; we do not detect or correct an inversion. We
+bound the skew, and we measure and page on the inversions.**
 
 | | |
 | --- | --- |
-| **Bound it** | our hosts run NTP; drift above **500 ms** is a host alarm, so of A10's 2 seconds at most a quarter is ours |
-| **Measure it** | **cross-side near-tie inversions per hour** — `field_change` rows with `outcome='superseded'` whose superseding change has the opposite `origin` and `abs(delta occurred_at) <= 2 s`. This is the precise form of part 11's third number |
-| **Warn** | 5 per hour |
-| **Call someone** | **20 per hour**, or any rolling 4-hour window in which **80% or more** of inversions resolve in favour of one origin |
+| **Bound** | hosts run NTP; drift above **500 ms** is a host alarm, so at most a quarter of A10's 2 s is ours |
+| **Measure** | **cross-side near-tie inversions/hour** — `superseded` rows whose superseding change has the opposite `origin` and `abs(Δ occurred_at) ≤ 2 s`; the precise form of part 11's third number |
+| **Warn / page** | 5/hour; **20/hour**, or any rolling 4-hour window where **≥ 80%** of inversions favour one origin |
 
-The bias threshold is the one that matters. Genuine races go both ways, so a
-sustained one-directional result is the signature of real skew rather than real
-contention, and it can sit under any volume threshold indefinitely.
+The bias threshold does the work: genuine races go both ways, so a sustained
+one-directional result is the signature of real skew and would sit under any
+volume threshold indefinitely. **No deterministic in-window tiebreak** is
+offered because it would have to rank by something other than time, and both
+candidates are worse than the inversion they fix — arrival order is confounded
+by Salesforce's 5-second emission delay (A13), which exceeds the skew, and a
+fixed origin preference would make Appendix B's race settle on the wrong value.
+Being wrong is bounded: the mis-ranked edit is in history with its actor, both
+copies still converge, and the nightly sweep (row 6, 10.4) is the backstop.
 
-**Why no deterministic in-window tiebreak.** Any such rule would have to rank
-edits by something other than time, and both candidates are worse than the
-inversion they fix: arrival order at our endpoint is confounded by Salesforce's
-emission delay, which at 5 seconds (A13) is larger than the skew itself; and a
-fixed origin preference inside the window would make Appendix B's race resolve
-on the finance value rather than the sales one. A correct cross-side order
-needs a sequencer both sides share, which is open question 1.
+---
 
-**What being wrong costs, bounded:** the mis-ranked edit is in `field_change`
-with its actor and time, both copies still converge on the same value, and the
-nightly full sweep (row 6 of 10.4) is the backstop.
-
-## 8. The rule for a duplicate webhook, and for an older one arriving after a newer one
+## 8. Duplicates and out-of-order changes
 
 ### 8.1 A duplicate webhook
 
-**The rule: `eventId` is the idempotency key, claimed in the same transaction
-as the apply.**
+**`eventId` is the idempotency key, claimed in the same transaction as the
+apply.** No row from the `ON CONFLICT DO NOTHING` means we have seen it:
+commit, answer `200 {"status":"duplicate"}`, change nothing. Salesforce has
+done nothing wrong (A7), so this is counted, not alerted.
 
-```sql
-INSERT INTO inbound_event (event_id, object_type, sf_id, occurred_at, payload_hash, outcome)
-VALUES ($1, $2, $3, $4, $5, 'in-progress')
-ON CONFLICT (event_id) DO NOTHING
-RETURNING event_id;
-```
+Two independent layers, **and only the second is the guarantee:**
 
-No row returned means we have seen this event. We commit and answer
-`200 {"status":"duplicate"}`, having changed nothing. Salesforce has done
-nothing wrong — A7 says it may deliver twice — so this is not an error and is
-not alerted, only counted.
+1. *Suppression* — the table. A duplicate does no work.
+2. *Harmlessness* — the strict `>` of 7.2. Even unsuppressed, re-applying a
+   change whose order key equals the stored one does nothing.
 
-What makes this rule trustworthy is that it has **two independent layers**:
+Layer 1 falls to a prune, a restore, or a truncate; layer 2 holds regardless.
+**A design resting on the table alone is one retention policy away from
+corrupting data.** Two details: a repeated `eventId` with a *different*
+`payload_hash` is a provider bug — first write wins and this one **is** alerted,
+because the key we trust is not unique; and **a duplicate is not an echo** — a
+duplicate is one event twice under one `eventId`, an echo a distinct event
+describing our own write.
 
-1. **Suppression** — the table above. A duplicate does no work at all.
-2. **Harmlessness** — the strict `>` in the order key (part 7.2). Even if
-   layer 1 failed to suppress a duplicate, re-applying a change whose order key
-   already equals the stored one does nothing, because equal is not greater.
+### 8.2 An older webhook after a newer one
 
-The second layer is the one that lets me sleep. Layer 1 can be defeated:
-`inbound_event` is pruned at 30 days, a restore from backup could lose recent
-rows, and an operational mistake could truncate it. In every one of those cases
-a redelivered event is still a no-op. Layer 1 is an optimisation that saves
-work; layer 2 is the correctness guarantee. A design with only layer 1 is one
-retention policy away from corrupting data.
-
-Three details:
-
-- **Retention is 30 days**, which costs 104 MB (part 4.7). The window only has
-  to exceed Salesforce's retry horizon, and since the cost is negligible there
-  is no reason to trim it close.
-- **Same `eventId`, different `payload_hash`** is a provider bug: the first
-  write wins, we do not apply the second, and this one *is* alerted, because it
-  means the key we are trusting is not unique.
-- **A duplicate is not an echo.** A duplicate is one event delivered twice and
-  carries the same `eventId`. An echo is a genuine, distinct event — with its
-  own `eventId` — that happens to describe our own write. They arrive looking
-  similar and need different rules, which is why `CONTEXT.md` separates the
-  words.
-
-### 8.2 An older webhook arriving after a newer one
-
-**The rule: compare order keys per field; a change that is not strictly newer
-never becomes the current value, and is recorded as `superseded`.**
-
-Worked through, with the exercise's own sample shape:
+**Compare order keys per field; a change not strictly newer never becomes
+current, and is recorded `superseded`.**
 
 ```
-evt_A  phone -> +919876500001   occurredAt 11:30:04.000   (sales.user)
-evt_B  phone -> +919876500002   occurredAt 11:30:09.000   (sales.user)
+evt_A  phone -> ...0001  occurredAt 11:30:04.000    evt_B  phone -> ...0002  11:30:09.000
 
-B arrives first:
-    order_key(11:30:09.000, 1, evt_B) > stored  -> APPLIED
-    contact.phone        := +919876500002
-    field_version[phone] := (11:30:09.000, 1, evt_B)
-    sf_value             := +919876500002,  sf_observed_at := 11:30:09.000
-
-A arrives second:
-    (a) 11:30:04.000 is NOT newer than sf_observed_at 11:30:09.000
-        -> sf_value is left alone. We already know a later Salesforce state.
-    (c) order_key(11:30:04.000, 1, evt_A) < stored  -> SUPERSEDED
-        field_change += (phone, +919876500001, sales.user, 11:30:04, 'superseded')
-        the current value stays +919876500002
-    (d) sf_value (+919876500002) = current value  -> NO repair write
+B first:  11:30:09 > stored           -> APPLIED. current ...0002,
+                                         sf_value ...0002, sf_observed_at 11:30:09
+A second: (a) 11:30:04 NOT > 11:30:09 -> sf_value LEFT ALONE (a later SF state is known)
+          (c) 11:30:04 < 11:30:09     -> SUPERSEDED. history keeps ...0001,
+                                         sales.user, 11:30:04; current stays ...0002
+          (d) sf_value = current      -> NO repair write
 ```
 
-Step (a) is why this is correct and not merely plausible. A naive version of
-the repair rule — "the incoming value differs from ours, so tell Salesforce" —
-would fire here and waste a call, because `evt_A` describes a *past* state of
-Salesforce, not its current one. Tracking `sf_observed_at` alongside `sf_value`
-is what distinguishes "Salesforce disagrees with us" from "Salesforce told us
-about something old".
+Step (a) is why this is correct and not merely plausible: a repair rule
+comparing the incoming value against ours would fire here and waste a call,
+because `evt_A` describes a **past** state of Salesforce, not its current one.
 
-**No reordering buffer, deliberately.** We do not hold events back hoping the
-missing earlier one arrives, because A11 gives us no sequence numbers, so we
-cannot detect that anything is *missing* — a buffer could only wait a fixed
-time and would add that latency to every event in order to maybe help a rare
-one. The per-field comparison gets the same answer without the latency. If open
-question 1 comes back as Change Data Capture, replay ids would let us detect a
-genuine gap, and then a short buffer becomes worth reconsidering.
-
-**An event can be partly applied.** Fields are independent (part 5.1), so one
-event may apply `phone` and supersede `city`; `inbound_event.outcome` is then
-`partial`.
+**No reordering buffer, deliberately:** A11 gives no sequence numbers, so we
+cannot detect that anything is *missing*, and a buffer could only wait a fixed
+time, adding that latency to every event to maybe help a rare one. Change Data
+Capture replay ids (open question 1) would let us detect a real gap, and then a
+short buffer is worth reconsidering.
 
 ### 8.3 The repair write — one condition for every case
 
-Part 7.1 established that we are the only party that merges, so whenever our
-decision differs from what Salesforce holds, we owe Salesforce a call. With
-`sf_value` tracked separately from the merge decision, that whole obligation
-collapses into **one condition, checked after every field, regardless of what
-happened to it**:
+> **After every field, regardless of what happened to it: if
+> `field_version.sf_value` is distinct from the current value, enqueue a repair
+> write.**
 
-> **`if field_version.sf_value is distinct from the current value: enqueue a
-> repair write.`**
-
-Every case falls out of it rather than needing its own rule:
-
-| What happened | `sf_value` after | Current value | Repair? |
+| What happened | `sf_value` after | Current | Repair? |
 | --- | --- | --- | --- |
 | Salesforce change applied | the new value | the same | no |
-| Salesforce value superseded by a newer portal edit | Salesforce's value | ours | **yes** — Salesforce is wrong |
-| older event after a newer one (8.2) | unchanged, the newer one | matches it | no |
-| echo of our own write | the value we sent | the same | no |
+| Salesforce value superseded by a newer portal edit | Salesforce's | ours | **yes** |
+| older event after a newer one (8.2) | unchanged | matches it | no |
+| echo of our own write | what we sent | the same | no |
 | Salesforce restates a value we hold | that value | the same | no |
-| full-record restatement during an outage (8.4) | Salesforce's stale value | our unsent edit | **yes** — and we already owed it |
+| full-record restatement during an outage (8.4) | Salesforce's stale value | our unsent edit | **yes** |
 
-**This terminates.** The repair sends our current value; Salesforce stores it
-and echoes it; the echo sets `sf_value` to that same value; the condition is
-then false and no further repair is created. One repair, one echo, done — and
-part 9's rule L1 is the general statement of why.
-
-The same condition is also the entire logic of outage recovery (part 10.3).
-The sweep reads Salesforce's current values, feeds them in as observations, and
-the fields needing repair are exactly the ones where the condition comes out
-true. Recovery needed no special code, which is a good sign the condition is at
-the right level.
+It **terminates** — the repair sends our current value, the echo sets
+`sf_value` to it, the condition goes false — and it is the **entire logic of
+outage recovery** (10.3): feed Salesforce's current values in as observations
+and the fields needing repair are those where the condition is true.
 
 ### 8.4 If a webhook carries the full record instead
 
-A3 assumes changed-fields-only. The exercise asks what the rule does
-otherwise, and the honest answer is that **full-record mode is the dangerous
-one**, because in it a field's silence and a field's restatement look
-identical.
+A3 assumes changed-fields-only. **Full-record mode is the dangerous one,**
+because a field's silence and its restatement look identical.
 
-The hazard, concretely. During the outage, finance sets `city` to Noida at
-15:00; it is queued and unsent. At 16:00 a sales user changes the phone, and
-the full-record webhook carries `city: "Gurugram"` — Salesforce's stale copy —
-stamped 16:00. Compared as a change, `16:00 > 15:00`, so we would apply it and
-**overwrite the finance edit with an older value that Salesforce was merely
-restating.** That is exactly the data loss this whole exercise is about, caused
-by a payload shape.
+*The hazard:* during the outage finance sets `city` to Noida at 15:00, unsent.
+At 16:00 a sales user changes the phone and the full-record payload carries
+`city: "Gurugram"` — Salesforce's stale copy — stamped 16:00. Compared as a
+change, `16:00 > 15:00`, so we would **overwrite the finance edit with an older
+value Salesforce was merely restating:** exactly the loss this exercise is
+about, caused by a payload shape.
 
-**The rule in full-record mode** is step (b) of part 5.1:
+*The rule* is step (b) of the apply: **a field whose canonical value equals the
+`sf_value` we already held is a restatement — not restamped, not compared, not
+touched.** Traced: `sf_value[city]` is already `Gurugram`, so `city` is skipped
+and stays Noida, and 8.3 enqueues the repair we already owed; `phone` differs
+from its `sf_value` and applies normally. Both come out right.
 
-> A field in the payload counts as a change only if its canonical value is
-> **distinct from the `sf_value` we already held**. A field equal to it is a
-> restatement: we do not restamp it, we do not compare it, we do not touch it.
-
-Traced through the hazard: `sf_value[city]` is already `Gurugram`, so the
-incoming `Gurugram` is a restatement and `city` is skipped; the current value
-stays Noida; and condition (d) sees `sf_value` Gurugram against current Noida
-and enqueues the repair we already owed. Meanwhile `phone` differs from its
-`sf_value`, so it is a real change and applies normally. Both fields come out
-right.
-
-Two things worth saying about this. First, **step (b) is unconditional** — it
-runs whatever shape the payload has. It costs nothing, because `sf_value` and
-`sf_observed_at` exist for part 8.3 anyway; in changed-fields mode it only ever
-skips a re-save of an identical value, which is a no-op in any case; and it is
-*required* by the outage sweep (part 10.3) regardless of what the webhook looks
-like. Making it unconditional is why `applyChanges` needs no payload-shape
-parameter at all. Second, it is still weaker than changed-fields-only, because a
-restatement that happens to coincide with a real Salesforce edit to the same
-field *in the same payload* is invisible to us — the values are equal, so we
-cannot tell a deliberate re-save from an unchanged field. That residual gap is
-the reason A3 is the assumption I would most like to have confirmed in writing,
-and why I would ask for changed-fields-only if the client has any say in how
-the webhook is built.
+**Step (b) is unconditional**, whatever the payload shape, which is why
+`applyChanges` needs no mode parameter: in changed-fields mode it only skips a
+re-save of an identical value, and it is **required by the outage sweep**
+(10.3) regardless. Full-record remains the weaker shape, since a restatement
+coinciding with a real Salesforce edit to the same field in one payload is
+invisible to us — which is why A3 is the assumption I would most want confirmed
+in writing.
 
 ---
 
 ## 9. The rule that stops a loop
 
-Ranked second of eight in part 3: every other failure damages the records it
-touches, while a loop consumes the whole 100 requests/second budget and stops
-sync for every record at once, within seconds of deployment.
+Ranked second of eight: every other failure damages the records it touches,
+while a loop consumes the whole 100 req/s budget and stops sync for every
+record at once, within seconds of deployment.
 
-### 9.2 L1 — the structural rule, and the termination guarantee
+### 9.1 L1 — the structural rule, and the termination guarantee
 
 > **Outbound work is created exactly when `field_version.sf_value` differs from
-> a field's current value — condition (d) of part 5.1, after every field, on
-> both paths, and nowhere else.**
+> a field's current value — condition 8.3, after every field, on both paths,
+> and nowhere else.**
 
-*We call Salesforce when, and only when, we believe Salesforce disagrees with
-us.*
+*We call Salesforce when, and only when, we believe Salesforce disagrees with us.*
 
 ```
-portal sets city = Noida   -> sf_value "Gurugram" <> "Noida"  -> 1 outbound row
-we PATCH Noida, 2xx        -> sf_value := "Noida"             (6.4)
-Salesforce echoes Noida    -> sf_value "Noida" = current      -> 0 rows.  Dead.
+portal sets city = Noida  -> sf_value "Gurugram" <> "Noida"  -> 1 outbound row
+we PATCH Noida, 2xx       -> sf_value := "Noida"                            (6.3)
+Salesforce echoes Noida   -> sf_value "Noida" = current       -> 0 rows.  Dead.
 ```
 
-The loop has no fuel after one hop — not because a rule caught it, but because
-there is nothing left to disagree about.
+No fuel after one hop — not because a rule caught it, but because there is
+nothing left to disagree about. **Precondition: canonical form (7.3)**, since
+two spellings of one value are the only way to give the loop fuel.
 
-**Precondition: canonical form (7.3).** Two spellings of one value would make
-an echo look like a change, which is the only way to give the loop fuel. If
-Salesforce reformats a phone we sent and we compare raw strings, the sync
-becomes a generator of its own traffic.
-
-### 9.3 L2 — the actor rule
+### 9.2 L2 — the actor rule
 
 > A webhook whose `changedBy` is the integration user (A6) is an echo:
 > recorded, never compared, never applied.
@@ -1626,33 +610,31 @@ becomes a generator of its own traffic.
 stops on the right value. The echo of our own write carries the time Salesforce
 stored it, which is later than the edit that write overwrote, so compared as a
 change it would win and launder our value back over a newer edit from the other
-side — Appendix B traces exactly that. It also closes part 5.2 case (c).
+side — Appendix B traces exactly that. It also closes 5.1 case (c).
 
-### 9.4 L3 — the echo fence
+### 9.3 L3 — the echo fence
 
-> After a 2xx, the sender records the record, field and hash of the canonical
+> After a 2xx the sender records the record, field and hash of the canonical
 > value sent, expiring in 15 minutes; an inbound change matching an unexpired
 > entry is an echo.
 
-L2's guarantee keyed on the value we sent rather than on the actor, so it still
-holds if A6 is false; it also suppresses a wasted repair when two of our own
-writes to one field are in flight at once. Safe because the fence is written
-after the response, so it can never exist for a call that did not land, and
-because a genuine Salesforce edit setting the very value we just sent is
-indistinguishable from an echo and treating it as one changes nothing.
+L2's guarantee keyed on the value rather than the actor, so it still holds if
+A6 is false, and it suppresses a wasted repair when two of our own writes to
+one field are in flight. Safe because the fence is written after the response,
+so it cannot exist for a call that did not land, and because a genuine
+Salesforce edit setting the value we just sent is indistinguishable from an
+echo and treating it as one changes nothing.
 
-### 9.5 L4 — the repair breaker
+### 9.4 L4 — the repair breaker
 
 > Above **5 repairs to one field in an hour**, enqueue nothing more for it,
 > mark it contested, and alert.
 
 Bounds the one way L1 fails: a value Salesforce stores in a spelling our
-canonical form does not normalise makes each echo read as disagreement, and the
-two systems argue at one request per round trip forever. When it trips we keep
-serving our value and stop arguing — knowingly different on one field beats
-spending the cap on an argument neither side can win.
-
-### 9.6 What each layer is worth
+canonical form does not normalise makes every echo read as disagreement, and
+the two systems argue at one request per round trip forever. When it trips we
+keep serving our value and stop arguing — knowingly different on one field
+beats spending the cap on an argument neither side can win.
 
 | | Guarantees | Absent |
 | --- | --- | --- |
@@ -1661,330 +643,202 @@ spending the cap on an argument neither side can win.
 | L3 | L2's guarantee without A6 | nothing, while A6 holds |
 | L4 | bounds L1's one failure mode | an unbounded argument over one field |
 
-## 10. The 6-hour outage: what is on disk, how we drain it, the arithmetic
+---
 
-### 10.1 What the outage is
+## 10. The 6-hour outage
 
-Six hours in which the Salesforce record API is unreachable and webhooks
-Salesforce tried to send may never arrive. Per A16 I design for both directions
-being dark at once, which is the harder reading of the brief and the one its two
-sentences jointly imply.
+### 10.1 What it is
 
-**The outage arithmetic uses the business-hours average of 3 edits/second, not
-A1's 20/second peak.** Stating that up front because the two give very
-different answers — about 6 minutes against about 35 — and the choice is a
-judgement, not an oversight. A peak is a 15-minute phenomenon: month-end, a
-bulk reassignment, a morning rush. Six consecutive hours of it is not a
-credible event, and sizing the headline answer for one would overstate what the
-client should expect every time. The peak is carried as a named bound instead —
-row 3 of the table in 10.4 — so both numbers are on the page and neither is
-hiding.
+Six hours with the Salesforce API unreachable and webhooks sent during it
+possibly never arriving — dark both ways at once (A16).
 
-**The portal keeps working throughout.** Finance and customer-success staff
-edit records, their edits apply locally, appear immediately in the portal, and
-queue for Salesforce. Nothing is read-only and nothing is refused. The only
-thing the outage costs is visibility in Salesforce, and the 30-second target
-does not apply during it — the exercise is explicit that catch-up is a
-different target, and the number we commit to instead is the drain time in
-10.4.
+**The arithmetic uses the business-hours average of 3 edits/s, not A1's 20/s
+peak.** Saying so up front because the two differ greatly — about 6 minutes
+against about 35 — and the choice is a judgement, not an oversight: a peak is a
+15-minute phenomenon, and six consecutive hours of one is not credible, so
+sizing the headline for it would overstate what the client should expect. The
+peak is carried as row 3 of 10.4, so both numbers are on the page.
+
+**The portal keeps working throughout.** Staff edit records, edits apply
+locally and appear at once, and queue for Salesforce. Nothing is read-only. The
+only cost is visibility in Salesforce, and the 30-second target does not apply
+during catch-up — the brief says so, and the number we commit to instead is
+10.4's.
 
 ### 10.2 What is on disk
 
-| On disk | At the worst moment | Why it is there |
+| | At the worst moment | Why |
 | --- | --- | --- |
-| `outbound_change` rows, `state='pending'` | **19,440 rows, ~4.9 MB** (row 1, 10.4) | each committed in the same transaction as the portal edit that caused it (part 6.1) |
-| rows left `inflight` by a restart | a handful | reclaimed when their 30-second lease expires (part 6.6) |
-| `sync_watermark` | one row per object type | where the inbound sweep will resume from |
-| `field_change`, `field_version`, typed rows | normal growth | the portal is fully operational; local history is complete |
+| `outbound_change`, `pending` | **19,440 rows, ~4.9 MB** | each committed in the same transaction as the edit that caused it (6.1) |
+| rows left `inflight` by a restart | a handful | reclaimed when the 30-second lease expires |
+| `sync_watermark` | one row per object type | where the sweep resumes |
+| history and typed rows | normal growth | the portal is fully operational |
 
-Five megabytes. That is what "pending calls to Salesforce must still be there
-after our own process restarts" costs, and it is worth stating plainly because
-the requirement sounds expensive and is not.
-
-**A restart during the outage is a non-event.** The rows are committed, so they
-survive; leases expire and the rows return to `pending`; the circuit breaker
-starts closed, opens again on its first five failures, and resumes probing.
-Nothing is lost and nothing needs a human.
+Five megabytes is what "pending calls must still be there after our process
+restarts" costs. **A restart during the outage is a non-event:** rows are
+committed so they survive, leases expire and rows return to `pending`, the
+breaker reopens on its probes. Nothing needs a human.
 
 ### 10.3 How we drain it — and why the order is not negotiable
 
-The recovery has a strict ordering requirement that took me a second pass to
-see, so it goes first:
-
 > **The inbound sweep must complete before the outbound drain begins.**
 
-Here is the loss it prevents. Finance sets a contact's city to Noida at 15:00;
-the row queues unsent. At 17:00 a sales user sets the same city to Delhi in
-Salesforce; that webhook never arrives. The link returns at 21:00.
+The loss it prevents: finance sets a city to Noida at 15:00, queued unsent; at
+17:00 a sales user sets it to Delhi in Salesforce and that webhook never
+arrives; the link returns at 21:00. *Drain first:* we PATCH Noida, Salesforce's
+Delhi is overwritten, and the sweep then reads back our own value and learns
+nothing — **Delhi is destroyed with no record it existed**, and nothing in the
+system would report it. *Sweep first:* Delhi's `SystemModstamp` of 17:00 beats
+the portal's 15:00, Noida is kept as `superseded` under the finance user's
+name, 8.3 finds nothing owed, and the queued row then sends the **current**
+value (6.3) — Delhi, a no-op. Both edits on record, both copies agreeing.
 
-- *Drain first:* we PATCH Noida. Salesforce's Delhi is overwritten and gone.
-  The sweep then reads Salesforce and finds Noida — our own value — and learns
-  nothing. **Delhi is destroyed with no record that it ever existed**, which is
-  precisely the failure this whole exercise is about, and nothing in the
-  system would ever report it.
-- *Sweep first:* we read Delhi with its `SystemModstamp` of 17:00 and feed it
-  in as an observation. The order key compares 17:00 against the portal's
-  15:00, Delhi wins, Noida is recorded as `superseded` with the finance user's
-  name, and condition (d) finds `sf_value` equal to the current value so no
-  repair is owed. The queued row is still there, and when the drain reaches it
-  the sender reads the **current** value (part 6.3) and sends Delhi — a no-op.
-  Both edits are on record and both copies agree.
+The window is small, which is the point: with 14,954 portal-touched and 34,892
+Salesforce-touched records out of 5 M (row 1), the expected overlap is
+`14,954 x 34,892 / 5,000,000` = **104 records**. The ordering costs no time and
+protects exactly the hundred records where an edit would vanish.
 
-The window is small and that is the point. With 14,954 portal-touched records
-and 34,892 Salesforce-touched records out of 5 million (row 1, 10.4), the
-expected overlap is `14,954 x 34,892 / 5,000,000` ≈ **104 records**. The ordering rule changes no
-timing and protects about a hundred records in six million edits — and those
-hundred are exactly the ones where an edit would be silently destroyed.
+**The sweep depends on the restatement rule and could not work without it.** A
+`SystemModstamp` is a *record's* modification time, not a field's, so a record
+touched at 17:00 hands back every one of its fields stamped 17:00 — including
+fields last changed months ago, which compared as changes would beat any portal
+edit made during the outage. Step (b) of 8.4 stops it, which is why that rule
+is unconditional.
 
-**The sweep relies on the restatement rule, and could not work without it.**
-A `SystemModstamp` is a
-*record's* modification time, not a field's, so a record touched at 17:00 hands
-us every one of that record's fields stamped 17:00 — including fields last changed months
-ago. Compared as changes, those would beat any portal edit made during the
-outage and overwrite it with Salesforce's stale value. Step (b) of part 5.1 is
-what stops it: a field whose value equals the `sf_value` we already held is a
-restatement, skipped and not restamped. So the rule written for A3's "other
-case" turns out to be **required by outage recovery no matter which payload
-shape the webhook uses** — which is the reason part 8.4 makes it unconditional,
-and the reason the merge needs no payload-shape parameter.
-
-The sequence:
-
-```
-1. the breaker's probe succeeds -> the link is back
-2. HOLD the outbound drain
-3. for each object type, page through:
-      SELECT Id, <fields>, SystemModstamp FROM {Type}
-       WHERE SystemModstamp > :watermark ORDER BY SystemModstamp      (A4)
-   feed each record through applyChanges as a full-record observation
-   with occurred_at = its SystemModstamp, origin = salesforce
-4. advance sync_watermark to the highest SystemModstamp fully applied,
-   after each page -> a crash resumes from the page boundary, and a
-   small re-read overlap is harmless because applying an observation
-   twice is a no-op (strict > in part 7.2)
-5. RELEASE the drain, at half rate, ramping (part 6.5)
-```
-
-Two things that are safe without extra machinery. Webhooks are arriving
-normally again during step 3, and both paths go through the same `applyChanges`
-behind the same record lock, so there is no race — a webhook for a record the
-sweep has not reached yet applies normally, and the sweep's later observation
-for it carries an equal-or-older `SystemModstamp` and becomes a no-op. And the
-drain skips what the sweep resolved: a claim-time filter drops any row whose
-field already has `sf_value` equal to the current value, since part 8.3's
-condition says nothing is owed.
+The sequence is [Appendix C.5](#c5-outage-recovery): probe, hold the drain,
+page through the changed-since query feeding each record in as a full-record
+observation, advance the watermark per page so a crash resumes at a page
+boundary, then release the drain at half rate. Webhooks arriving mid-sweep are
+safe without extra machinery — same `applyChanges`, same record lock, and the
+sweep's later observation for such a record carries an equal-or-older stamp and
+is a no-op — and the drain skips what the sweep resolved by dropping at claim
+time any row whose field already has `sf_value` equal to the current value.
 
 ### 10.4 The arithmetic — every figure, in one table
 
 **The shared derivation, written once.** Every number in this document comes
-out of these six lines; the table then varies one assumption per row.
+out of these lines; the table varies one assumption per row.
 
 ```
-window              6 h x 3600                              = 21,600 s
-queued changes      portal edits/s x 21,600
-outbound calls      queued changes / 1.3 changes per record   (coalescing, 6.3)
-drain capacity      governor - 7.4 req/s reserved for live traffic
-                    (7.4 = peak steady state: (6 + 0.7 repairs) x 1.1 retries, 6.5)
-drain               resume at half the governor, +5 req/s every 30 s, then full capacity
-sweep               Salesforce records / 2,000 per SOQL page   (requests)
-                    Salesforce records / 500 per second        (local apply)
-total               sweep + drain       -- the sweep blocks the drain (10.3)
+window           6 h x 3600                                 = 21,600 s
+queued changes   portal edits/s x 21,600
+outbound calls   queued changes / 1.3 changes per record      (coalescing, 6.3)
+drain capacity   governor - 7.4 req/s reserved for live traffic
+                 (7.4 = peak steady state: (6 + 0.7 repairs) x 1.1 retries, 6.4)
+drain            resume at half the governor, +5 req/s every 30 s, then full capacity
+sweep            Salesforce records / 2,000 per SOQL page     (requests)
+                 Salesforce records / 500 per second          (local apply)
+total            sweep + drain  -- the sweep blocks the drain (10.3)
 ```
 
-| # | Scenario | What varies | portal /s | queued | calls | drain | SF records | sweep reqs | sweep | **total** |
+| # | Scenario | What varies | portal /s | queued | calls | drain | SF records | reqs | sweep | **total** |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | **1** | **base** | — | 0.90 | 19,440 | 14,954 | 5.1 | 34,892 | 18 | 1.2 | **6.3** |
 | 2 | no coalescing | 1.0 changes/record | 0.90 | 19,440 | 19,440 | 6.3 | 34,892 | 18 | 1.2 | **7.5** |
 | 3 | sustained peak | A1 → 20 edits/s | 6.00 | 129,600 | 99,692 | 27.7 | 232,615 | 117 | 7.8 | **35.4** |
-| 4 | portal-heavy | A2 → 70% portal, live reserve 15.7 | 2.10 | 45,360 | 34,892 | 12.0 | 14,954 | 8 | 0.5 | **12.5** |
+| 4 | portal-heavy | A2 → 70% portal, reserve 15.7 | 2.10 | 45,360 | 34,892 | 12.0 | 14,954 | 8 | 0.5 | **12.5** |
 | 5 | contended cap | A12 → governor 25 | 0.90 | 19,440 | 14,954 | 14.8 | 34,892 | 18 | 1.2 | **16.0** |
 | 6 | no changed-since | A4 false → compare all 5 M | 0.90 | 19,440 | 14,954 | 5.1 | 5,000,000 | 2,500 | 16.7 | **21.8** |
 
 Drain, sweep and total are minutes. **Row 1 is the answer: about 6 minutes.**
 
-**Row 1, with the division shown:**
-
 ```
-queued     0.9 x 21,600                            = 19,440 changes
-calls      19,440 / 1.3                            = 14,954
-capacity   70 - 7.4                                = 62.6 req/s at full rate
-ramp       35, 40, 45, 50, 55, 60, 65 req/s, 30 s each, each minus 7.4
+Row 1, with the division shown
+queued     0.9 x 21,600                             = 19,440 changes
+calls      19,440 / 1.3                             = 14,954
+capacity   70 - 7.4                                 = 62.6 req/s at full rate
+ramp       35,40,45,50,55,60,65 req/s, 30 s each, each minus 7.4:
            (27.6+32.6+37.6+42.6+47.6+52.6+57.6) x 30 = 8,946 calls in 210 s
-rest       (14,954 - 8,946) / 62.6                 = 96.0 s
-drain      210 + 96.0 = 306.0 s                    = 5.1 minutes
-sweep      2.1 x 21,600 / 1.3                      = 34,892 records
-           34,892 / 2,000                          = 18 requests (0.3 s of budget)
-           34,892 / 500                            = 69.8 s = 1.2 minutes
-TOTAL      1.2 + 5.1                               = 6.3 minutes
+rest       (14,954 - 8,946) / 62.6                  = 96.0 s
+drain      210 + 96.0 = 306.0 s                     = 5.1 minutes
+sweep      2.1 x 21,600 / 1.3                       = 34,892 records
+           34,892 / 2,000 = 18 requests (0.3 s of budget)
+           34,892 / 500   = 69.8 s                  = 1.2 minutes
+TOTAL      1.2 + 5.1                                = 6.3 minutes
 ```
 
-Allow **under 10 minutes** operationally, the margin covering page-fetch
-latency, retries and the breaker needing a few probes to close.
+Allow **under 10 minutes** operationally, covering page-fetch latency, retries,
+and the breaker needing a few probes to close.
 
-**What the table says, beyond row 1:**
-
-- **The cap is the floor, not our design.** Row 3's 99,692 calls at the full
-  100 requests/second with no reserve at all would take
-  `99,692 / 100 = 997 s = 16.6 minutes`. So in the worst credible case our 30%
-  safety reserve costs about 11 minutes of catch-up, and no change on our side
-  beats 16.6. That is the trade to put in front of the client (A12).
-- **One request reads 2,000 records; one request writes 1.** Which is why the
-  inbound side of a blackout is nearly free in API terms — 18 requests, 0.3
-  seconds — and why recovery is dominated by the outbound drain in every row
-  except 6.
-- **Row 5 is the row that matters most**, because it is the only one driven by
-  a number we choose rather than one we observe. If other integrations in the
-  client's org are already spending 60 of the 100, catch-up goes from 6 minutes
-  to 16 with no code change at all.
-- **Row 6 demotes A4 from load-bearing to preferable.** A full compare of all 5
-  million records costs 2,500 query requests, 40 seconds of API budget and
-  about 17 minutes of local merge. Having costed it I would want that sweep
-  **running nightly regardless of A4**, as the standing net under lost
-  webhooks, canonicalisation gaps, the fields L4 gave up on, and the clock-skew
-  inversions of 7.6.
-
-## 11. Three numbers I would watch, and when I would call someone
-
-Three, chosen so that each covers a different way this system fails: **outbound
-is stuck**, **inbound is slow**, and **we are getting it wrong**. The third is
-the only one that detects incorrectness rather than slowness, and it is the one
-I would be most reluctant to give up.
-
-### Number 1 — the age of the oldest unsent change
-
-```sql
-SELECT EXTRACT(epoch FROM clock_timestamp() - MIN(created_at))
-  FROM outbound_change WHERE state = 'pending';
-```
-
-| | |
-| --- | --- |
-| **Normal** | under 5 seconds |
-| **Warn** | 60 seconds |
-| **Call someone** | **300 seconds (5 minutes)** |
-
-Why age and not depth: depth is meaningless on its own, because 19,000 rows
-draining fast is healthy and 3 rows stuck is not. Age answers the question
-that matters — is anything actually waiting?
-
-Five minutes is ten times the 30-second commitment, which is long enough that
-no ordinary burst, retry or ramp reaches it, and short enough to leave most of
-the drain window. The page means one of three things and the first action is to
-tell them apart: the sender lost its leader lease and nothing is sending, the
-circuit breaker is open because Salesforce is unreachable, or a poison record
-at the head of the queue is being retried forever.
-
-### Number 2 — how far behind the inbound path is
-
-```sql
--- p99 over the last 5 minutes of applied_at - occurred_at, for Salesforce-origin rows
-```
-
-| | |
-| --- | --- |
-| **Normal** | under 6 seconds (part 2.4's budget) |
-| **Warn** | 20 seconds |
-| **Call someone** | **above 30 seconds, sustained for 5 minutes** |
-
-This measures the whole path including Salesforce's own emission delay, which
-is deliberate: the 30 seconds we promised the client is end to end, and a
-number that excluded the part we do not control would be a number that stays
-green while we miss the commitment.
-
-The five-minute qualifier matters. A single slow event is noise. Sustained
-breach is either a genuine Salesforce emission problem — in which case the page
-produces a conversation with the client about A13 rather than a code change —
-or our endpoint is saturated, which part 2.4 says we should answer with an
-inbound queue.
-
-### Number 3 — the divergence rate
-
-```sql
--- (i) volume, per minute, summed:
---     outbound_change rows with reason = 'repair'
---   + field_change rows with outcome = 'superseded' AND origin = 'salesforce'
--- (ii) skew, per hour: cross-side near-tie inversions, defined in part 7.6 --
---     superseded rows whose superseding change has the opposite origin and
---     abs(delta occurred_at) <= 2 s
-```
-
-| | Volume (i) | Skew (ii) |
-| --- | --- | --- |
-| **Normal** | near zero | under 1 per hour |
-| **Warn** | 10 per minute | 5 per hour |
-| **Call someone** | **100 per minute** | **20 per hour**, or a rolling 4-hour window in which **80%+** resolve in favour of one origin |
-
-This is the number that catches being *wrong* rather than being slow, and
-nothing else in the system would report any of what it catches: a clock skew
-beyond A10, a canonicalisation gap that is making echoes look like changes, a
-loop rule that has stopped working, or a Salesforce-side process overwriting
-portal edits in bulk.
-
-The second threshold is the subtler one. Divergence should be symmetric —
-genuine races go both ways. A *sustained one-directional* bias at any volume is
-the signature of a systematic problem, and I would want to be called for it
-even at 3 per minute, because it is exactly what A10 failing looks like and it
-would otherwise sit under the warn line indefinitely.
-
-### On the dashboard, but not among the three
-
-Each of these is a leading indicator of one of the three above, which is why it
-does not earn a page of its own: the current governor rate and the count of 429
-responses (leading into number 1), the circuit breaker's state and consecutive
-failure count (number 1), the count of rows in `failed` and of fields the
-repair breaker has marked contested (number 3), webhook signature failures and
-400 responses (a leading indicator of a Salesforce-side change to the payload),
-and the lag of `sync_watermark` behind now (whether the nightly sweep of row 6,
-part 10.4, is keeping up).
-
-One deliberate omission: there is no alert on queue *depth*. During catch-up
-the depth is supposed to be 19,000, and an alert that fires every time the
-system does its job correctly is an alert people learn to close.
+**What the table says beyond row 1.** The **cap is the floor, not our design**:
+row 3's 99,692 calls at the full 100 req/s with no reserve is still
+`99,692 / 100 = 997 s = 16.6 min`, so our 30% reserve costs about 11 minutes in
+the worst credible case and nothing on our side beats 16.6 — the trade to put
+in front of the client (A12). **One request reads 2,000 records and one writes
+1**, which is why the inbound side of a blackout is nearly free (18 requests,
+0.3 s) and recovery is dominated by the drain in every row but 6. **Row 5
+matters most**, being the only row driven by a number we choose rather than
+observe. And **row 6 demotes A4** from load-bearing to preferable: a full 5 M
+compare costs 2,500 requests, 40 s of API budget and ~17 min of local merge, so
+I would want that sweep **running nightly regardless of A4**, as the standing
+net under lost webhooks, canonicalisation gaps, fields L4 gave up on, and
+7.6's inversions.
 
 ---
 
-## 12. What I am leaving out of this weekend's work
+## 11. Three numbers I would watch
 
-### Out of scope because the exercise says so
+One per failure mode: outbound stuck, inbound slow, and getting it wrong. The
+third is the only one that detects incorrectness rather than slowness.
 
-Deletes (A15), Salesforce login and authorisation screens, any visual user
-interface, a second region, and load testing against real Salesforce. Where
-code exists it runs against a fake Salesforce I wrote.
+| | Number | Normal | Warn | **Call someone** |
+| --- | --- | --- | --- | --- |
+| **1** | **age of the oldest unsent change** — `min(created_at)` over `pending` rows | < 5 s | 60 s | **300 s (5 min)** |
+| **2** | **inbound lag** — p99 of `applied_at − occurred_at` over Salesforce-origin rows, last 5 min | < 6 s | 20 s | **> 30 s sustained 5 min** |
+| **3** | **divergence** — repairs enqueued + Salesforce-origin `superseded` rows, per minute; **and** 7.6's near-tie inversions per hour | ~0; < 1/h | 10/min; 5/h | **100/min; or 20/h, or ≥ 80% one-directional over 4 h** |
 
-### Out of scope because I chose to leave it out
+**Age, not depth,** for number 1: 19,000 rows draining fast is healthy and 3
+rows stuck is not, and during catch-up a depth alarm fires exactly when the
+system is doing its job — which is how alarms get muted. Its page means one of
+three things, and the first action is to tell them apart: the sender lost its
+lease, the breaker is open, or a poison row at the head is being retried
+forever.
 
-Each of these is a real thing the client would eventually need. I am naming
-them with what they would cost rather than letting them be discovered later.
+Number 2 deliberately **includes Salesforce's own emission delay**, which is
+not ours to fix, because the 30 seconds we promised is end to end and a number
+excluding it would stay green while we miss the commitment.
 
-| Left out | What it would take | Why it can wait |
-| --- | --- | --- |
-| **The initial backfill of 5 million records** | designed as S8 in part 3 and costed as row 6 of part 10.4 — 2,500 query requests, 40 seconds of API budget, about 17 minutes of local merge | one-off, offline, re-runnable, and it needs the merge rule to exist first |
-| **Salesforce authentication lifecycle** | a connected app, a refresh token, and rotation. Assumed working throughout | mechanical, well-documented, and no design decision rests on it |
-| **Schema change handling** | a picklist value the client adds in Salesforce that our canonicalisation does not know (part 7.3) | part 9.5's repair breaker degrades safely into a contested field and an alert rather than a loop |
-| **Merging records that are already duplicated** | a matching rule, and a way to fold two histories into one | a pre-existing data-quality problem, not one this sync creates |
-| **Field-level permissions** | a table of who may edit what, enforced on both paths | open question 6; building it before the answer would be a guess |
-| **Attachments, notes, files, and every object beyond the nine fields** | more of the same machinery, keyed the same way | A14; nothing in the design is written per field, so a tenth field is configuration |
-| **The portal's overwrite notice** (part 7.5) | a read-after-save and an inline message | the rule and the data behind it are designed; it is the UI that is out of scope |
-| **Right-to-erasure against permanent history** | a decision, then probably crypto-shredding of the values with the change records kept | open question 5, and it is a legal question before it is an engineering one |
-| **The monitoring itself** | wiring part 11's three numbers into whatever the client already uses | the queries are in part 11; the plumbing is site-specific |
+Number 3 is the one I would least give up: nothing else reports a skew past
+A10, a canonicalisation gap turning echoes into changes, a loop rule that
+stopped working, or a Salesforce process overwriting portal edits in bulk —
+all of which look healthy on latency and queue metrics.
 
-### What I would build first if this were real work
-
-In the order of part 3, and the first week would be S1 and S2 alone — the merge
-rule, the history, the canonical forms, and the single condition that creates
-outbound work — tested against a fake Salesforce, with no real integration
-connected at all. Everything after that is plumbing around a decision that has
-to be right first.
-
-The single most valuable thing I could do before writing any of it is get open
-question 1 answered: **how is the webhook actually produced?** If it is Change
-Data Capture, replay ids give a real sequence, which retires A11, strengthens
-part 8.2 from ordering-what-arrived to detecting-what-is-missing, and makes the
-recovery sweep a replay instead of a comparison. That one answer changes more
-of this document than any other.
+**On the dashboard but not paging,** each a leading indicator of the above: the
+governor's current rate and 429 count, the breaker's state, rows in `failed`
+and fields marked contested, signature failures and 400s (a Salesforce-side
+payload change), and `sync_watermark` lag (whether the nightly sweep keeps up).
 
 ---
 
+## 12. What I am leaving out
+
+**Because the exercise says so:** deletes (A15), Salesforce login screens, any
+visual UI, a second region, and load testing real Salesforce. Where code
+exists it runs against a fake Salesforce I wrote.
+
+**Because I chose to,** each named with its cost rather than left to be
+discovered:
+
+| Left out | What it would take | Why it waits |
+| --- | --- | --- |
+| the initial 5 M backfill | designed as S8, costed as row 6 of 10.4 — 2,500 requests, 40 s of API budget, ~17 min of local merge | one-off, offline, re-runnable, and it needs the merge rule first |
+| Salesforce auth lifecycle | a connected app, refresh token, rotation; assumed working | mechanical, and no design decision rests on it |
+| schema-change handling | a picklist value the client adds that 7.3 does not know | L4 degrades it into a contested field and an alert rather than a loop |
+| merging already-duplicated records | a matching rule, and folding two histories | a pre-existing data-quality problem, not one this sync creates |
+| field-level permissions | a table of who may edit what, enforced on both paths | open question 6; building it before the answer is a guess |
+| attachments, notes, objects beyond the nine fields | more of the same machinery, keyed the same way | A14 — a tenth field is configuration |
+| the portal's overwrite notice (7.5) | a read-after-save and an inline message | the rule and the data are designed; the UI is out of scope |
+| right-to-erasure against permanent history | a decision, then likely crypto-shredding values while keeping the change records | open question 5 — a legal question before an engineering one |
+| the monitoring itself | wiring part 11's numbers into what the client already uses | the queries are in part 11; the plumbing is site-specific |
+
+**What I would build first:** S1 and S2 alone for a week — the merge rule, the
+history, canonical form, and the one condition — against a fake Salesforce with
+no real integration connected. Everything after is plumbing around a decision
+that has to be right first. And before writing any of it, I would get open
+question 1 answered: if the webhook is Change Data Capture, replay ids retire
+A11, strengthen 8.2 from ordering-what-arrived to detecting-what-is-missing,
+and turn the recovery sweep into a replay. That one answer changes more of this
+document than any other.
 ## Appendix A: the exercise's worked scenario, traced
 
 The scenario from the brief — sales creates a customer, finance corrects the
@@ -1993,11 +847,11 @@ must end with **the new phone and the finance city** — traced through every
 rule, with a duplicate and a late event added so all four required rules
 appear. The contact is `0031A00000Abc` in Salesforce and `P` in the portal.
 
-### Step 1 — sales creates the contact in Salesforce
+#### Step 1 — sales creates the contact in Salesforce
 
 `evt_1`, `occurredAt 11:00:00.000`, `changedBy sales.user@client.example`.
 
-The Salesforce id is unknown and `changedBy` is a human, so part 5.2 case (b):
+The Salesforce id is unknown and `changedBy` is a human, so 5.1 case (b):
 mint `P`, write the `record_link`, apply every field as a first write. The
 email `ASHA@Client.example` is canonicalised to `asha@client.example` (7.3).
 
@@ -2008,7 +862,7 @@ sf_value       every field = the value just applied,  sf_observed_at = 11:00:00.
 condition (d)  sf_value = current for every field          -> 0 outbound rows
 ```
 
-### Step 2 — finance corrects the city in the portal
+#### Step 2 — finance corrects the city in the portal
 
 A finance user saves `{"city": "Noida"}`. Per A9 the time is our database's
 `clock_timestamp()` — `11:00:20.000` — and the actor is the authenticated
@@ -2021,14 +875,14 @@ field_change  += (city, "Gurugram" -> "Noida", finance.user, 11:00:20.000, appli
 condition (d) sf_value "Gurugram" <> current "Noida"       -> 1 outbound row
 ```
 
-### Step 3 — the sync worker sends it
+#### Step 3 — the sync worker sends it
 
 Claims the row, reads the **current** value at send time (6.3), sends one
 `PATCH {City: "Noida"}`, gets a 2xx, writes `echo_fence(P, city, hash("Noida"))`
 and marks the row `sent`. **This is the only outbound call in the entire
 scenario.**
 
-### Step 4 — Salesforce echoes our own write
+#### Step 4 — Salesforce echoes our own write
 
 `evt_2`, `occurredAt 11:00:25.000`, `changedBy integration.user@tequity`,
 `{"city": "Noida"}`. This is the loop rule.
@@ -2041,11 +895,11 @@ L2          changedBy is the integration user                  -> classified ECH
 (d)         sf_value "Noida" = current "Noida"                 -> 0 outbound rows
 ```
 
-The loop ends here, and part 9.2 is why: there is nothing left to disagree
+The loop ends here, and 9.1 is why: there is nothing left to disagree
 about. Had L2 been unavailable (A6 false), the echo would have been a
 `confirmed` observation and (d) would still have produced nothing.
 
-### Step 5 — sales changes the phone in Salesforce
+#### Step 5 — sales changes the phone in Salesforce
 
 `evt_3`, `occurredAt 11:05:00.000`, `changedBy sales.user`,
 `{"phone": "+919876500002"}`. Changed-fields-only (A3), so `city` is not in the
@@ -2059,18 +913,18 @@ payload and is never looked at.
 (d)  sf_value = current                                        -> 0 outbound rows
 ```
 
-### Step 6 — Salesforce delivers `evt_3` a second time
+#### Step 6 — Salesforce delivers `evt_3` a second time
 
 ```
 INSERT ... ON CONFLICT (event_id) DO NOTHING  -> 0 rows  -> 200 {"status":"duplicate"}
 ```
 
 Nothing happens, and nothing is alerted — A7 permits this. And if
-`inbound_event` had been pruned, layer 2 of part 8.1 still holds: the order key
+`inbound_event` had been pruned, layer 2 of 8.1 still holds: the order key
 would be *equal*, not greater, so (c) applies nothing, `sf_observed_at` is not
 advanced by (a), and (d) finds nothing owed. Harmless either way.
 
-### Step 7 — an older phone event arrives late
+#### Step 7 — an older phone event arrives late
 
 `evt_0`, `occurredAt 11:04:00.000` — earlier than `evt_3`, delivered after it —
 `{"phone": "+919876500000"}`.
@@ -2087,9 +941,9 @@ advanced by (a), and (d) finds nothing owed. Harmless either way.
 Step (a) is the whole reason this costs nothing. A repair rule that compared
 the incoming value against ours would have fired here and wasted a call, since
 `evt_0` describes a past state of Salesforce rather than its current one. This
-is the bug part 8.3 exists to prevent.
+is the bug 8.3 exists to prevent.
 
-### The result
+#### The result
 
 ```
 contact P   phone = "+919876500002"      <- sales, 11:05:00
@@ -2143,7 +997,7 @@ current := F ;  field_change += (OLD -> F, finance.user, applied)
 
 **Step 3 — our call lands.** The sender reads the current value at send time
 (6.3) and sends F. Salesforce now holds F: **the sales edit has been
-overwritten in Salesforce.** On the 2xx (6.4):
+overwritten in Salesforce.** On the 2xx (6.3):
 ```
 sf_value := F ,  sf_observed_at := 10:00:05.000
 echo_fence(phone, hash(F))
@@ -2175,7 +1029,7 @@ L2  -> ECHO. sync_observation('echo'). Step (c) never runs.
 holds S. `sf_value := S`. Its own echo then makes `sf_value` equal the current
 value and condition (d) goes false. Settled.
 
-### The result
+#### The result
 
 ```
 portal:      phone = S  (sales, 10:00:01)
@@ -2187,7 +1041,7 @@ history:     OLD -> F  finance.user  10:00:00  applied
 **Both copies end on the sales value**, and the finance edit is on record with
 its author rather than being silently discarded.
 
-### Why the echo cannot win on its later `occurredAt`
+#### Why the echo cannot win on its later `occurredAt`
 
 Because it is classified as an echo by `changedBy` **before** any order-key
 comparison happens, so its 10:00:05 stamp is never compared — which is
@@ -2195,7 +1049,7 @@ load-bearing rather than tidy, since that stamp is later than the sales edit's
 10:00:01 and would otherwise let our own write launder the value we sent back
 over a newer edit from the other side.
 
-### The bug this trace found
+#### The bug this trace found
 
 Without step 3's `sf_value := F`, step 4(a) would have seen `10:00:01.000 >
 09:00:00` and set `sf_value := S`. Condition (d) would then have compared S
@@ -2204,3 +1058,361 @@ leaving Salesforce holding F and the portal holding S, permanently, with every
 metric green. The fix is one line in the sender, and the reason it was missing
 is that I had been treating `sf_value` as "what Salesforce told us" when it has
 to mean "what we believe Salesforce holds", and our own writes are part of that.
+
+---
+
+## Appendix C: interfaces, schema and the sequences
+
+Reference for parts 2, 4, 5, 6 and 10. No new rules — the body's rules in the
+form you would build from.
+
+### C.1 The interface on each side
+
+```
+(i) OUR WEBHOOK ENDPOINT -- what Salesforce sees
+POST /sync/salesforce/webhook     X-Signature: hex(hmac-sha256(secret, raw_body))  (A7)
+{ "eventId":"evt_1001", "recordId":"0031A00000Abc", "objectType":"Contact"|"Account",
+  "occurredAt":"2026-11-02T11:30:04.000Z",         (A11)
+  "changedBy":"sales.user@client.example",         (A6)
+  "changedFields":{ "phone":"+919876543210" } }    (A3)
+
+200 {"status":"applied"|"duplicate"|"echo"|"partial"}  committed; never resend
+400 malformed / unknown objectType or field            do not retry
+401 signature failed                                   do not retry
+503 + Retry-After                                       resend shortly (5 case c, or shedding)
+500 we failed unexpectedly                              retry; it is safe (8.1)
+
+A 200 is returned ONLY after our transaction commits, and redelivering an event
+that got a 200 is harmless. We never return 200 to mean "accepted, will
+process later" -- that would be a promise with no durable record of it.
+
+(ii) THE SALESFORCE RECORD API -- our entire dependency. Each is idempotent BY
+     DESIGN, which is what makes at-least-once sending safe (6.5).
+update   PATCH /sobjects/{Type}/{sfId}                   -> 204      sends current values, so a repeat converges
+upsert   PATCH /sobjects/{Type}/{ExtIdField}/{portalId}  -> 201|204  keyed on OUR id (A5), so a repeat cannot duplicate
+changed  GET   /query?q=SELECT Id,<fields>,SystemModstamp
+                      FROM {Type} WHERE SystemModstamp > :watermark  -> a read   (A4)
+
+(iii) MERGE -- the one interface every edit path goes through, called from the
+      endpoint, the portal's save handler, and the recovery sweep.
+applyChanges({ record, origin:"salesforce"|"portal", actor, occurredAt,
+               originEventId, changes:{field: rawValue} })
+  -> [{ field, outcome:"applied"|"superseded"|"echo"|"confirmed"|"restatement",
+        previousValue, newValue, enqueuedOutbound }]
+
+A caller must know only: it runs inside a transaction the caller owns; it takes
+ONE lock per record (the record_link row), so concurrent merges serialise with
+no lock ordering to get right; and it is idempotent for the same originEventId
+and occurredAt. The payload shape is deliberately NOT a parameter (A3) -- the
+restatement rule of 8.4 answers both cases, and a parameter selecting between
+two behaviours is two interfaces wearing one name.
+```
+
+### C.2 Schema
+
+```sql
+CREATE TABLE customer (
+  portal_id     uuid PRIMARY KEY,
+  name          text,
+  status        text,
+  owner         text,
+  updated_at    timestamptz NOT NULL
+);
+
+CREATE TABLE contact (
+  portal_id     uuid PRIMARY KEY,
+  full_name     text,
+  phone         text,          -- stored in canonical form, 7.3
+  email         text,          -- stored in canonical form
+  city          text,
+  owner         text,
+  customer_id   uuid REFERENCES customer(portal_id),
+  updated_at    timestamptz NOT NULL
+);
+
+CREATE TABLE field_version (
+  object_type      text    NOT NULL,          -- 'Customer' | 'Contact'
+  portal_id        uuid    NOT NULL,
+  field            text    NOT NULL,
+  -- the order key, 7.2. These three columns ARE the comparison.
+  occurred_at      timestamptz(3) NOT NULL,
+  origin_rank      smallint NOT NULL,          -- salesforce = 1, portal = 0
+  origin_event_id  text    NOT NULL,
+  -- who and where, kept for display without reading history
+  origin           text    NOT NULL,
+  actor            text    NOT NULL,
+  -- what we believe Salesforce currently holds for this field, and when we
+  -- last learned it. Updated by a Salesforce observation AND by our own
+  -- successful send (part 6.4) -- a write of ours is the most recent thing we
+  -- know about Salesforce's state. This pair is the whole basis of the repair
+  -- rule (8.3) and the restatement rule (8.4). Null until either happens.
+  sf_value         text,
+  sf_observed_at   timestamptz(3),
+  PRIMARY KEY (object_type, portal_id, field)
+);
+
+CREATE TABLE field_change (
+  seq              bigserial,
+  object_type      text    NOT NULL,
+  portal_id        uuid    NOT NULL,
+  field            text    NOT NULL,
+  old_value        text,                       -- canonical form; null on create
+  new_value        text,                       -- canonical form
+  occurred_at      timestamptz(3) NOT NULL,    -- the order key of this change
+  origin_rank      smallint NOT NULL,
+  origin_event_id  text    NOT NULL,
+  origin           text    NOT NULL,
+  actor            text    NOT NULL,
+  outcome          text    NOT NULL CHECK (outcome IN ('applied','superseded')),
+  applied_at       timestamptz NOT NULL DEFAULT clock_timestamp(),
+  PRIMARY KEY (seq, applied_at)
+) PARTITION BY RANGE (applied_at);          -- monthly partitions
+
+CREATE INDEX ON field_change (object_type, portal_id, field, occurred_at DESC);
+
+CREATE TABLE sync_observation (
+  object_type text, portal_id uuid, field text,
+  observed_value text, occurred_at timestamptz(3),
+  origin text, origin_event_id text, actor text,
+  outcome text NOT NULL CHECK (outcome IN ('echo','confirmed')),
+  observed_at timestamptz NOT NULL DEFAULT clock_timestamp()
+) PARTITION BY RANGE (observed_at);         -- monthly partitions, dropped at 90 days
+
+-- inbound idempotency. Part 8.1.
+CREATE TABLE inbound_event (
+  event_id     text PRIMARY KEY,              -- Salesforce's eventId
+  object_type  text NOT NULL,
+  sf_id        text NOT NULL,
+  occurred_at  timestamptz(3) NOT NULL,
+  payload_hash bytea NOT NULL,                -- sha256 of the raw body
+  outcome      text NOT NULL,                 -- applied | echo | superseded | partial | rejected
+  received_at  timestamptz NOT NULL DEFAULT clock_timestamp()
+);
+CREATE INDEX ON inbound_event (received_at);  -- for the 30-day prune
+
+-- the durable outbound queue. Part 6. This is what "pending calls survive a
+-- restart" means concretely: these rows are committed with the edit itself.
+CREATE TABLE outbound_change (
+  id              bigserial PRIMARY KEY,
+  object_type     text NOT NULL,
+  portal_id       uuid NOT NULL,
+  field           text NOT NULL,
+  reason          text NOT NULL,              -- 'portal-edit' | 'repair' | 'create' | 'recovery'
+  occurred_at     timestamptz(3) NOT NULL,    -- order key of the change that created this row
+  state           text NOT NULL DEFAULT 'pending',
+                  -- pending | inflight | sent | failed
+  attempts        int  NOT NULL DEFAULT 0,
+  next_attempt_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+  lease_owner     text,
+  lease_until     timestamptz,
+  last_error      text,
+  created_at      timestamptz NOT NULL DEFAULT clock_timestamp(),
+  sent_at         timestamptz
+);
+CREATE INDEX ON outbound_change (state, next_attempt_at)
+  WHERE state IN ('pending','inflight');      -- the claim query's only index
+CREATE INDEX ON outbound_change (object_type, portal_id) WHERE state = 'pending';
+CREATE INDEX ON outbound_change (object_type, portal_id, field, created_at)
+  WHERE reason = 'repair';                    -- the repair breaker's count (9.4)
+CREATE UNIQUE INDEX ON outbound_change (object_type, portal_id, field)
+  WHERE state = 'pending';                    -- at most one pending call per field
+
+-- identity across the two systems. S5. A portal-created record has a
+-- portal_id before it has an sf_id.
+CREATE TABLE record_link (
+  object_type text NOT NULL,
+  portal_id   uuid NOT NULL,
+  sf_id       text,                            -- null until Salesforce assigns one
+  linked_at   timestamptz,
+  PRIMARY KEY (object_type, portal_id)
+);
+CREATE UNIQUE INDEX ON record_link (object_type, sf_id) WHERE sf_id IS NOT NULL;
+
+-- "we just wrote this to Salesforce; expect to hear about it". Part 9, rule L3.
+CREATE TABLE echo_fence (
+  object_type text NOT NULL, portal_id uuid NOT NULL, field text NOT NULL,
+  value_hash  bytea NOT NULL,                  -- sha256 of the canonical value we sent
+  sent_at     timestamptz NOT NULL DEFAULT clock_timestamp(),
+  expires_at  timestamptz NOT NULL,            -- sent_at + 15 minutes
+  PRIMARY KEY (object_type, portal_id, field, value_hash)
+);
+
+-- how far through Salesforce's own change history we are confident. Part 10.
+CREATE TABLE sync_watermark (
+  object_type   text PRIMARY KEY,
+  system_modstamp timestamptz NOT NULL,        -- highest SystemModstamp we have seen (A4)
+  updated_at    timestamptz NOT NULL
+);
+```
+
+### C.3 The inbound apply, one transaction
+
+Part 5. Its four deliberate properties are in the body.
+
+```
+POST /sync/salesforce/webhook
+  |
+  |-- 1. read the raw body as bytes (the signature covers bytes, not re-serialised JSON)
+  |-- 2. verify X-Signature                              -> 401, no retry   (S7, A7)
+  |-- 3. validate the shape                              -> 400, no retry
+  |         missing eventId / unknown objectType / unknown field /
+  |         unparseable occurredAt / empty changedFields
+  |         Each is a distinct message. A 400 means "this will never work",
+  |         so we must be sure before sending one.
+  v
+BEGIN                                                    -- one transaction, no network calls inside
+  |
+  |-- 4. claim the event                                                    (8.1)
+  |      INSERT INTO inbound_event (...) VALUES (...)
+  |        ON CONFLICT (event_id) DO NOTHING RETURNING event_id;
+  |      no row returned -> duplicate -> COMMIT, 200 {"status":"duplicate"}
+  |
+  |-- 5. resolve and lock the record                                        (part 5)
+  |      SELECT portal_id FROM record_link
+  |        WHERE object_type = $1 AND sf_id = $2 FOR UPDATE;
+  |      This single lock serialises every merge on this record, inbound and
+  |      portal-side alike. It is the only lock the merge takes.
+  |
+  |-- 6. classify the whole event as echo or not                            (part 9)
+  |      changedBy = integration user?  -> echo
+  |
+  |-- 7. for each field in changedFields:
+  |        value := canonicalise(raw)                                       (7.3)
+  |
+  |        (a) learn what Salesforce holds -- unconditionally, before deciding
+  |            anything, and only if this is the newest word we have had:
+  |            if occurredAt > field_version.sf_observed_at or it is null:
+  |                field_version.sf_value      := value
+  |                field_version.sf_observed_at := occurredAt
+  |
+  |        (b) a field whose value equals the sf_value we already held is a
+  |            RESTATEMENT, not a change: skip (c) entirely.      (part 8.4)
+  |            A null sf_value means we have never heard Salesforce's value
+  |            for this field, so the incoming value is a change, not a
+  |            restatement. This runs in both payload shapes -- see 8.4.
+  |
+  |        (c) decide the current value:
+  |            if echo:                                                     (part 9)
+  |                sync_observation('echo')          -- no value change, ever
+  |            else if order_key(incoming) > order_key(stored):             (7.2)
+  |                UPDATE customer/contact SET <field> = value
+  |                UPSERT field_version with the new stamp
+  |                INSERT field_change(outcome='applied', old_value, new_value)
+  |            else if value is distinct from the current value:
+  |                INSERT field_change(outcome='superseded')                (part 8.2)
+  |            else:
+  |                sync_observation('confirmed')
+  |
+  |        (d) the one repair condition, checked after every field:         (8.3)
+  |            if field_version.sf_value is distinct from the current value:
+  |                INSERT outbound_change(reason='repair')
+  |
+  |-- 8. UPDATE inbound_event SET outcome = <applied|echo|superseded|partial>
+  v
+COMMIT
+  |
+  '-- 200 {"status": ...}      <- sent only after the commit returns
+```
+
+### C.4 The outbound worker loop
+
+Part 6.2.
+
+```
+every tick (on NOTIFY, or every 1 second as a fallback):
+
+  0. hold the leader lease                            (ADR 0003)
+     SELECT pg_try_advisory_lock(SENDER_LOCK_ID);  -- not held -> idle as standby
+
+  1. reclaim anything a dead process left behind      (6.6)
+     UPDATE outbound_change SET state='pending', lease_owner=NULL, lease_until=NULL
+      WHERE state='inflight' AND lease_until < clock_timestamp();
+
+  2. if the circuit breaker is open, probe instead of claiming   (6.5)
+
+  3. claim a batch, whole records at a time           (6.3)
+     WITH due AS (
+       SELECT object_type, portal_id, MIN(next_attempt_at) AS due
+         FROM outbound_change
+        WHERE state='pending' AND next_attempt_at <= clock_timestamp()
+        GROUP BY object_type, portal_id
+        ORDER BY due                      -- oldest-due record first: no starvation
+        LIMIT 200
+     ), picked AS (
+       SELECT o.id FROM outbound_change o JOIN due USING (object_type, portal_id)
+        WHERE o.state='pending' AND o.next_attempt_at <= clock_timestamp()
+        FOR UPDATE SKIP LOCKED
+     )
+     UPDATE outbound_change o
+        SET state='inflight', lease_owner=$me,
+            lease_until=clock_timestamp() + interval '30 seconds',
+            attempts = o.attempts + 1
+       FROM picked p WHERE o.id = p.id
+     RETURNING o.*;
+
+  4. group the claimed rows by (object_type, portal_id)
+  5. for each group: read the CURRENT values of those fields, build one call   (6.3)
+  6. governor.acquire(1 token)  -- every request, retries included            (6.5)
+  7. send; settle the whole group by the outcome                              (6.7)
+```
+
+### C.5 Outage recovery
+
+Part 10.3. The sweep must finish before the drain starts.
+
+```
+1. the breaker's probe succeeds -> the link is back
+2. HOLD the outbound drain
+3. for each object type, page through:
+      SELECT Id, <fields>, SystemModstamp FROM {Type}
+       WHERE SystemModstamp > :watermark ORDER BY SystemModstamp      (A4)
+   feed each record through applyChanges as a full-record observation
+   with occurred_at = its SystemModstamp, origin = salesforce
+4. advance sync_watermark to the highest SystemModstamp fully applied,
+   after each page -> a crash resumes from the page boundary, and a
+   small re-read overlap is harmless because applying an observation
+   twice is a no-op (strict > in 7.2)
+5. RELEASE the drain, at half rate, ramping (part 6.5)
+```
+
+---
+
+## Appendix D: assumption consequences, and rejected alternatives
+
+### D.1 If each assumption goes the other way
+
+Required reading beside part 1. One sentence each, as the exercise asks.
+
+| | If the answer goes the other way |
+| --- | --- |
+| **A1** | At a 200/s peak the portal's share alone is 60 req/s, so coalescing becomes load-bearing and the 30-s budget needs a per-record debounce; catch-up becomes row 3 of 10.4, 35.4 min. |
+| **A2** | Row 4: steady-state outbound roughly doubles to 15.7 req/s and catch-up becomes 12.5 min, consuming most of A12's headroom. |
+| **A3** | 8.4 is the rule: a field equal to the `sf_value` we hold is a restatement and is skipped. It runs in both modes anyway, so no code changes — but risk rises, because a field's silence and its restatement become indistinguishable. |
+| **A4** | Row 6: recovery becomes a full 5 M-record compare, 21.8 min instead of 6.3 — cheap enough that A4 is *preferable*, not load-bearing. I would run that sweep nightly regardless. |
+| **A5** | Create becomes search-then-create, which is racy, so every portal-originated create carries a duplicate-record risk needing a reconciliation sweep. |
+| **A6** | Loop layer L2 switches off and L3's fence carries the same guarantee by a different key (9.2–9.3); termination is unaffected, correctness of the winner is not. |
+| **A7** | At-most-once delivery makes every missed webhook permanent divergence, so A4's sweep becomes the primary inbound path and webhooks a latency optimisation on top. |
+| **A8** | With no hint we halve on any rejection and probe upward on success — which is what 6.4 already does; only recovery speed changes. |
+| **A9** | If a client-supplied edit time must be honoured (an offline client replaying saves), portal changes stop being monotonic per record and 8.1's duplicate rule must extend to portal saves, which currently cannot duplicate. |
+| **A10** | 7.6's inversion rate rises; both copies still converge and nothing is lost, but which edit wins inside the window becomes arbitrary, and 7.6's bias page is the detector. |
+| **A11** | A monotonic replay sequence (Change Data Capture) retires the tiebreakers and strengthens 8.2 from ordering-what-arrived to detecting-what-is-missing. |
+| **A12** | Row 5: a governor of 25 makes catch-up 16.0 min instead of 6.3 — one configured number, no design change. |
+| **A13** | At a 25-second emission delay the 30-second target is unachievable by any design on our side, and it becomes a conversation about the number rather than about the system. |
+| **A14** | A tenth field is configuration, not a code change, because nothing in the design is written per field. |
+| **A15** | A delete is a change whose new value is "gone": it needs a tombstone that survives in history, a rule for an edit arriving after a delete (the same order-key comparison), and a not-deleted predicate on every portal read. |
+| **A16** | If only the outbound direction fails, 10.3's inbound sweep shrinks to the records whose webhooks were lost. |
+
+### D.2 Alternatives rejected, and why
+
+The three big ones are ADRs. These are the smaller decisions a reader might
+otherwise re-propose.
+
+| Considered | Rejected because |
+| --- | --- |
+| **A reordering buffer** holding events back for the missing earlier one | A11 gives no sequence numbers, so we cannot detect that anything is *missing*; a buffer could only wait a fixed time, adding that latency to every event to maybe help a rare one. Worth reconsidering if open question 1 returns Change Data Capture, whose replay ids would expose a real gap. |
+| **A deterministic tiebreak inside the clock-skew window** (7.6) | Both candidates are worse than the inversion they fix: arrival order is confounded by Salesforce's 5-second emission delay (A13), which exceeds the 2-second skew, and a fixed origin preference would make Appendix B's race settle on the finance value rather than the sales one. A correct cross-side order needs a sequencer both sides share. |
+| **Storing the value on the outbound queue row** | Then a row queued at 09:00 during an outage delivers a value we superseded at 11:00, costing two calls and a window where Salesforce holds something stale. Reading the current value at send time also makes repair rows and recovery no-ops safe (6.3, 10.3). |
+| **An inbound queue** between the endpoint and the apply | At 14 commits a second it buys headroom we do not need and adds a component plus a lag term. The threshold that would change it is written down in part 2: inbound apply p99 above 1 s, or sustained commits above 500/s. |
+| **Alerting on outbound queue depth** rather than age | During catch-up the depth is *supposed* to be 19,000, so a depth alarm fires exactly when the system is working correctly — which is how alarms get muted. |
+| **Recording echoes in `field_change`** with the real history | An echo is not an edit by a person. It would inflate permanent history about 30% with non-history and, because the two have different retentions, make partition-level pruning impossible. |
+| **A per-field ownership table** (finance owns some fields, sales others) | That is open question 6. Building it before the answer would be a guess, and if the answer is yes, part 7 gets *simpler* for those fields rather than harder. |

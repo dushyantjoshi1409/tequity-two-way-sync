@@ -1122,3 +1122,185 @@ seconds of delay on the affected rows.
 A `failed` row is never deleted. It stays with its `last_error` as the queue's
 own record that something needs a person, and part 11's third number is how we
 find out.
+
+---
+
+## 7. The rule when both sides change the same record
+
+### 7.1 First, who is doing the merging
+
+This is not two peers reconciling. **Salesforce has no merge logic at all** —
+it takes whatever write arrives last and overwrites. We are the only party
+that compares anything. Three consequences follow, and they shape everything
+below:
+
+1. **Our database holds the merge decision.** The current value of a field is
+   what our comparison says it is.
+2. **Salesforce's copy is a projection of that decision**, kept in step by the
+   outbound path. It is not an input to the decision except as the content of
+   the webhooks it sends us.
+3. **Therefore, any time our decision differs from what we believe Salesforce
+   holds, we owe Salesforce a call.** A rejected webhook is not a no-op. It is
+   the discovery of a disagreement, and part 8.3 makes it a repair write.
+
+Point 3 is the one that is easy to miss, and leaving it out is how a design
+that looks correct converges to a permanently wrong Salesforce record.
+
+### 7.2 The order key — the field that decides which edit is current
+
+**Named exactly, as the exercise asks.** The current value of a field is the
+value of the change with the greatest **order key**, which is this triple
+compared left to right:
+
+```
+order_key = ( occurred_at , origin_rank , origin_event_id )
+```
+
+| Component | On a webhook | On a portal save |
+| --- | --- | --- |
+| `occurred_at` | **the payload's `occurredAt`** — the time Salesforce gives the event | **`clock_timestamp()` of the saving transaction**, taken in our database at the moment it writes (A9) |
+| `origin_rank` | `1` | `0` |
+| `origin_event_id` | **the payload's `eventId`** | the portal change id, a ULID minted per save |
+
+Stored in `field_version` as exactly those three columns (part 4.2). The rule:
+
+> **Apply the incoming change if and only if its order key is strictly greater
+> than the stored one.**
+
+Three things about that triple:
+
+- **Why `clock_timestamp()` and not the request body.** The sample portal edit
+  has no time field, so there is nothing in it to trust; and a client-supplied
+  time, like the client-supplied `editedBy`, is an assertion a caller could
+  forge. Our database generates both the time and — from the authenticated
+  session — the actor. `clock_timestamp()` rather than `now()` because `now()`
+  returns the transaction's start time, so two saves in one transaction would
+  tie needlessly.
+- **Why Salesforce wins an exact tie** (`origin_rank` 1 beats 0). Not
+  arbitrary: it is the cheaper direction. If a portal value loses to an
+  incoming Salesforce change we apply it and owe nothing, whereas if the
+  Salesforce change loses we owe a repair write. Preferring Salesforce on an
+  exact-millisecond tie therefore saves rate-limit budget and costs nothing,
+  since a tie means we have no real information about which came first.
+- **Why `origin_event_id` last.** Two distinct Salesforce edits to one field
+  can share a millisecond (A11). Comparing event ids lexicographically is
+  arbitrary but **total and stable**, which is the property that matters: the
+  same pair evaluated twice — which happens, because webhooks are redelivered
+  — always gives the same answer.
+
+The strictness of the comparison is load-bearing. Because it is `>` and not
+`>=`, re-applying a change we have already applied does nothing, which makes
+the whole inbound path idempotent independently of the duplicate table. Part
+8.1 relies on that.
+
+### 7.3 Canonical form, which is what makes the rest true
+
+Values are canonicalised **before** they are compared or stored, and the stored
+form is the canonical one.
+
+| Field | Canonical form |
+| --- | --- |
+| all text | Unicode NFC; trim; collapse internal whitespace runs to one space |
+| `email` | the above, then lowercased whole (we accept that the local part is case-sensitive in the RFC and case-insensitive in practice at every provider the client uses — an assumption worth one question) |
+| `phone` | E.164, using the contact's country; if parsing fails, keep digits with a leading `+` and raise the parse-failure counter |
+| `status` | mapped through the agreed picklist vocabulary, so our value and the Salesforce picklist label are one value |
+| `customer_id` | the `portal_id` UUID, lowercase hex |
+| empty | `''` and `NULL` are one thing, stored as `NULL` |
+
+This looks like hygiene and it is not. It is what makes part 9's loop rule
+true, and the failure without it is concrete: the portal sets a phone to
+`+919876543210`, we send it, Salesforce stores and reformats it as
+`+91 98765 43210`, and the webhook comes back. Compared raw, that is a
+*different* value with a *later* time, so we would apply it — our value
+changes, which creates outbound work, which Salesforce echoes again. One
+reformatting difference between the two systems is enough to turn the sync into
+a generator of its own traffic. Canonical comparison makes the two spellings
+one value, and the echo becomes the no-op it should always have been.
+
+### 7.4 Both sides change the same record, different fields
+
+This is the exercise's own scenario and it needs no conflict rule at all,
+which is the entire argument for ADR 0002. The comparison is per field and the
+lock is per record, so:
+
+- Finance sets `city` in the portal. `field_version[city]` gets a portal
+  stamp. `phone` is untouched.
+- Sales changes `phone` in Salesforce. The webhook names `phone` only (A3), so
+  only `field_version[phone]` is compared and only `phone` moves. `city` is
+  never looked at, let alone overwritten.
+- The portal ends with the new phone and the finance city, and
+  `field_change` holds one `applied` row for each, with its own actor and time.
+
+Appendix A traces it step by step with the echo in place.
+
+### 7.5 Both sides change the same field
+
+**Across the two sides.** The order key decides. Then, and this is the half
+that is not optional:
+
+- The winner becomes the current value. `field_change` gets an `applied` row.
+- **The loser is kept** — `field_change` gets a `superseded` row with its real
+  value, actor and time, because the exercise is explicit that the fact of an
+  earlier edit stays on record and that dropping it counts as losing a change.
+- **If the loser was Salesforce's value, a repair write is enqueued** (part
+  8.3), because of point 3 in 7.1: Salesforce now holds a value we have
+  rejected, and nobody but us will fix that.
+
+**Two portal users, same field** — the exercise asks this one directly. The
+record lock of part 5.1 means the two saves do not actually overlap; they
+serialise, so there is a first and a second rather than a tie. The second save
+wins on the order key, having a later `clock_timestamp()`.
+
+- *The second user:* their save succeeds, normally.
+- *The first user:* their value is in `field_change` as the value they set,
+  with their name, and then as the `old_value` of the change that replaced it.
+  Nothing is lost.
+- *What they **see*** is a product decision, and my rule is this: after a save
+  the portal re-reads the record and renders each field with its current value
+  and "set by X at T"; if what the user submitted is not the current value, it
+  shows an inline notice naming who replaced it. We do **not** block the save
+  and we do **not** show a merge dialog — the write already happened and the
+  user's intent is already recorded, so the honest thing is to make the
+  overwrite visible rather than to pretend it can be prevented. This is open
+  question 4 and I would rather the client chose.
+- *What goes to Salesforce:* in the sequential case both saves are real
+  transitions, so both create queue rows. Coalescing (part 6.3) collapses them
+  inside the 1-second window into one call carrying the current value; outside
+  it, two calls land in order and the second wins. Both are correct because the
+  sender reads the current value at send time.
+
+**How often does this actually happen?** Worth knowing, because it decides how
+much the rule matters. At A1's average of 3 edits/second over 27 million field
+slots, two edits landing on the same field inside the 6-second visibility
+window is, if edits were spread uniformly, about one event every two to three
+weeks (18 edits in a window, 18/27,000,000 per edit, over 86,400 edits a day).
+Edits are not uniform — they cluster on recently created and actively worked
+records — so I would assume one or two a day in reality and I would measure it
+with part 11's third number. Either way it is rare enough that getting the rule
+*right* matters much more than making it fast, which is why part 5 spends a
+record-level lock on it without hesitating.
+
+### 7.6 The honest weakness: two clocks
+
+A webhook's `occurred_at` comes from Salesforce's clock and a portal save's
+comes from ours, and 7.2 compares them directly. Within the skew window (A10,
+assumed 2 seconds) the ordering of a cross-side same-field pair can be wrong:
+an edit genuinely made second can be ranked first.
+
+I am accepting that rather than engineering around it, for three reasons:
+
+1. **It cannot cause divergence,** only mis-ranking. The comparison is made in
+   one place, by one system, deterministically, so our copy never oscillates
+   and the repair write brings Salesforce into line with whatever we decided.
+2. **Nothing is lost.** The mis-ranked edit is in `field_change` with its
+   actor and its time; the client's history requirement is met either way, and
+   a human looking at the two rows can see what happened.
+3. **The alternative needs something we do not have.** A correct cross-side
+   order needs a single sequencer both sides share — Salesforce Change Data
+   Capture replay ids would be it (A11), which is why open question 1 is the
+   highest-value question on the list.
+
+What I would do instead of engineering around it: keep our clock on NTP, and
+watch part 11's divergence number for a *systematic* bias in one direction,
+which is what a real skew problem looks like as opposed to the occasional
+genuine race.

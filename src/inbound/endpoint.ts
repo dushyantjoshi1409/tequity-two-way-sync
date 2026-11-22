@@ -24,7 +24,7 @@ import { randomUUID } from "node:crypto";
 import { applyChanges } from "../domain/merge.js";
 import { canonicalise } from "../domain/canonical.js";
 import { WebhookRejected } from "../domain/types.js";
-import type { AppliedField, EventOutcome, ObjectType } from "../domain/types.js";
+import type { AppliedField, EventOutcome } from "../domain/types.js";
 import { INTEGRATION_USER } from "../salesforce/client.js";
 import { sha256 } from "../store/store.js";
 import type { DurableStore, Tx } from "../store/store.js";
@@ -121,7 +121,14 @@ function applyWebhook(
   }
   if (claim === "conflict") {
     // The same eventId with a different payload means the key we are trusting
-    // is not unique. First write wins, and this one DOES deserve an alert.
+    // is not unique. First write wins, and unlike an ordinary duplicate this
+    // one IS alerted (design 8.1): a duplicate means Salesforce did what A7
+    // permits, while this means every idempotence guarantee keyed on `eventId`
+    // is suspect.
+    process.emitWarning(
+      `ALERT: eventId ${webhook.eventId} was reused with a different payload; ` +
+        `first write wins and this delivery was discarded`,
+    );
     return {
       status: 200,
       body: { status: "duplicate", reason: "eventId-reused-with-different-payload" },
@@ -188,7 +195,9 @@ function resolveRecord(tx: Tx, webhook: ValidWebhook, nowMs: () => number): Reso
       (l) => l.objectType === webhook.objectType && l.sfId === null,
     );
     if (unlinked) {
-      const waitedMs = nowMs() - (unlinked.linkedAtMs ?? nowMs());
+      // The age of the link row, not `linkedAtMs`, which is unset for exactly
+      // these unlinked rows and would make this bound unreachable.
+      const waitedMs = nowMs() - unlinked.createdAtMs;
       if (waitedMs < CREATE_ECHO_DEFER_LIMIT_MS) {
         return { kind: "defer", reason: "create-echo-before-link" };
       }
@@ -257,6 +266,7 @@ function classifyEcho(tx: Tx, webhook: ValidWebhook, portalId: string): boolean 
 /** Collapse the per-field outcomes into the event's own outcome. */
 function summarise(fields: readonly AppliedField[], isEcho: boolean): EventOutcome {
   if (isEcho) return "echo";
+  if (fields.length === 0) return "applied";
   const kinds = new Set(fields.map((f) => f.outcome));
   if (kinds.size === 1) {
     const only = [...kinds][0];
@@ -264,6 +274,11 @@ function summarise(fields: readonly AppliedField[], isEcho: boolean): EventOutco
     if (only === "superseded") return "superseded";
     if (only === "restatement") return "restatement";
     if (only === "echo") return "echo";
+    // `confirmed`: every field already held the incoming value, so nothing
+    // changed. Recorded as `confirmed` rather than rounded up to `applied`,
+    // for the same reason design 5 keeps it out of `field_change` — an event
+    // that changed nothing must not read as one that changed something.
+    if (only === "confirmed") return "confirmed";
     return "applied";
   }
   // Mixed outcomes are exactly what design 5's "fields are independent"
@@ -272,5 +287,4 @@ function summarise(fields: readonly AppliedField[], isEcho: boolean): EventOutco
   return "partial";
 }
 
-/** The object types the endpoint accepts, for the demo's printed output. */
-export const ACCEPTED_OBJECT_TYPES: readonly ObjectType[] = ["Customer", "Contact"];
+

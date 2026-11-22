@@ -26,6 +26,7 @@ import type { ObjectType } from "../domain/types.js";
 import type { ChangedRecord, SalesforceClient } from "./client.js";
 import {
   INTEGRATION_USER,
+  SalesforceAuthFailed,
   SalesforceRejected,
   SalesforceThrottled,
   SalesforceUnreachable,
@@ -64,6 +65,8 @@ interface FakeState {
   throttleRetryAfterMs: number;
   /** Writes touching this field are refused as invalid data. */
   rejectField: string | null;
+  /** True while the fake refuses our credentials (design 6.5's 401/403 row). */
+  authFails: boolean;
   /**
    * Values the fake rewrites on write, to reproduce Salesforce reformatting
    * what we sent. Used to show why canonical form is load-bearing (design 7.3).
@@ -81,6 +84,7 @@ function emptyFakeState(): FakeState {
     throttleNextCalls: 0,
     throttleRetryAfterMs: 50,
     rejectField: null,
+    authFails: false,
     reformat: {},
   };
 }
@@ -152,6 +156,18 @@ export class FakeSalesforce implements SalesforceClient {
   }
 
   /** Make writes touching `field` fail as invalid data (a row failure). */
+  /**
+   * Refuse our credentials on every call until called again with `false`.
+   *
+   * Exists so design 6.5's 401/403 row is exercised rather than merely
+   * written down: the sender must keep the work and stop, not burn the queue
+   * into `failed` against a credential that cannot succeed.
+   */
+  failAuth(fails: boolean): void {
+    this.state.authFails = fails;
+    this.persist();
+  }
+
   rejectWritesTo(field: string | null): void {
     this.state.rejectField = field;
     this.persist();
@@ -301,6 +317,8 @@ export class FakeSalesforce implements SalesforceClient {
 
   /** The failure levers, checked in the order the real API would hit them. */
   private guardCall(values: Readonly<Record<string, string | null>>): void {
+    // Credentials are checked before anything else, as the real API would.
+    if (this.state.authFails) throw new SalesforceAuthFailed("INVALID_SESSION_ID");
     if (this.state.down) throw new SalesforceUnreachable();
     if (this.state.throttleNextCalls > 0) {
       this.state.throttleNextCalls -= 1;

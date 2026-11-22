@@ -455,9 +455,10 @@ describe("applyChanges: the repair breaker (design 9.4, rule L4)", () => {
       contestedField(store);
       recordSentRepairs(store, "city", 5);
 
-      // The boundary, asserted on purpose: the threshold is "above 5", so the
-      // sixth repair is still sent. Without this, an off-by-one would stop
-      // repairs a round trip early and look like correct behaviour.
+      // The boundary, asserted on purpose: the threshold is "more than 5
+      // repairs already made", so the sixth is still sent. Without this, an
+      // off-by-one would stop repairs a round trip early and look like
+      // correct behaviour (design 9.4).
       assert.equal(fieldResult(feedLosingSalesforceEdit(store), "city").enqueuedOutbound, true);
       assert.deepEqual(
         outboundOf(store)

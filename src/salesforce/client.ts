@@ -61,6 +61,21 @@ export class SalesforceThrottled extends Error {
  * failure: a value the portal accepts and Salesforce will not is a schema
  * disagreement that needs a human, so retrying it blindly only burns the cap.
  */
+/**
+ * The credentials were refused: a 401 or 403.
+ *
+ * Its own type because design 6.5 gives it its own row and its own
+ * consequence: the row is kept and its attempt restored, and **the sender
+ * stops**. Treated as an ordinary endpoint failure it would burn the whole
+ * queue into `failed` while every call was guaranteed to fail.
+ */
+export class SalesforceAuthFailed extends Error {
+  constructor(message = "credentials refused") {
+    super(message);
+    this.name = "SalesforceAuthFailed";
+  }
+}
+
 export class SalesforceRejected extends Error {
   constructor(message: string) {
     super(message);

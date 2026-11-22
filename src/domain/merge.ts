@@ -369,9 +369,14 @@ function enqueueRepairIfNeeded(
   // our canonical form does not normalise makes every echo read as
   // disagreement, and the two systems then argue at one request per round trip
   // forever — spending the whole 100 req/s budget and stopping sync for every
-  // record at once. Above 5 repairs to one field in an hour we keep serving our
-  // value and stop arguing: knowingly different on one field beats spending
-  // the cap on an argument neither side can win.
+  // record at once. Once a field has had MORE THAN 5 repairs inside the hour we
+  // keep serving our value and stop arguing: knowingly different on one field
+  // beats spending the cap on an argument neither side can win.
+  //
+  // The comparison reads the repairs ALREADY made, so the sixth is still sent
+  // and the seventh is not. The boundary is asserted in the tests on purpose,
+  // because an off-by-one here stops repairs a round trip early and looks like
+  // correct behaviour (design 9.4).
   if (tx.repairsInLastHour(objectType, portalId, field) > 5) {
     // The design marks the field contested and alerts. This demo has no
     // alerting surface and no column for it, so the fact is emitted as a

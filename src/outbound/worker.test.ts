@@ -13,8 +13,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, test } from "node:test";
 
+import { StoreWriteError } from "../domain/types.js";
 import type { ObjectType } from "../domain/types.js";
 import {
+  SalesforceAuthFailed,
   SalesforceRejected,
   SalesforceThrottled,
   SalesforceUnreachable,
@@ -312,5 +314,70 @@ describe("SyncWorker restart recovery", () => {
     await worker.runOnce();
     // Claimed increments; a row failure keeps it.
     assert.equal(store.read((tx) => tx.outboundRows()[0]?.attempts), 1);
+  });
+});
+
+describe("SyncWorker: a credential failure stops the sender (design 6.5)", () => {
+  test("the work is kept, the attempt is restored, and the sender stops", async () => {
+    seedOwed("portal-1", { city: "Noida" });
+    salesforce.failWith = () => new SalesforceAuthFailed("INVALID_SESSION_ID");
+
+    const report = await worker.runOnce();
+
+    assert.equal(report.sent, 0);
+    assert.equal(worker.isStopped, true);
+    const rows = store.read((tx) => tx.outboundRows());
+    assert.deepEqual(
+      rows.map((r) => [r.state, r.attempts]),
+      [["pending", 0]],
+      "pending with its attempt given back: a credential failure is not the row's fault",
+    );
+  });
+
+  test("a stopped sender claims nothing further, so the queue cannot burn down", async () => {
+    seedOwed("portal-1", { city: "Noida" });
+    seedOwed("portal-2", { city: "Delhi" });
+    salesforce.failWith = () => new SalesforceAuthFailed();
+
+    await worker.runOnce();
+    const callsAfterFirst = governor.grantedCount;
+
+    // Without the stop, every remaining row would spend an attempt — and the
+    // whole queue would reach `failed` against a credential that cannot work.
+    const second = await worker.runOnce();
+    assert.equal(second.claimed, 0);
+    assert.equal(governor.grantedCount, callsAfterFirst, "no further requests spent");
+    assert.deepEqual(
+      store
+        .read((tx) => tx.outboundRows())
+        .map((r) => r.state)
+        .sort(),
+      ["pending", "pending"],
+    );
+  });
+});
+
+describe("SyncWorker: a store failure is not an endpoint failure", () => {
+  test("it propagates instead of being counted toward the breaker", async () => {
+    // A create: the send returns an id, and recording that id is a store
+    // write. Before the fix that write sat inside the send's try-block, so a
+    // disk problem was reported as an endpoint failure and could open the
+    // circuit breaker against a Salesforce that was perfectly healthy.
+    seedOwed("portal-1", { city: "Noida" }, null);
+
+    const realTransaction = store.transaction.bind(store);
+    const patched = store as unknown as { transaction: typeof realTransaction };
+    patched.transaction = ((body) => {
+      // Armed only once the send has landed, so this is precisely the
+      // `linkSfId` write and not the claim or the reclaim.
+      if (salesforce.upserts.length > 0) throw new StoreWriteError("disk full");
+      return realTransaction(body);
+    }) as typeof realTransaction;
+
+    await assert.rejects(() => worker.runOnce(), /disk full/);
+
+    patched.transaction = realTransaction;
+    assert.equal(salesforce.upserts.length, 1, "the send did land");
+    assert.equal(worker.isBreakerOpen, false, "a disk problem must not open the breaker");
   });
 });

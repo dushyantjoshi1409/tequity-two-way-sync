@@ -25,6 +25,7 @@
 import { fieldNames } from "../domain/fields.js";
 import type { ObjectType } from "../domain/types.js";
 import {
+  SalesforceAuthFailed,
   SalesforceRejected,
   SalesforceServerError,
   SalesforceThrottled,
@@ -84,6 +85,7 @@ interface RecordBatch {
 export class SyncWorker {
   private consecutiveEndpointFailures = 0;
   private breakerOpenUntilMs = 0;
+  private stoppedReason?: string;
 
   constructor(
     private readonly store: DurableStore,
@@ -98,6 +100,17 @@ export class SyncWorker {
   /** True while the breaker is open and we are probing rather than draining. */
   get isBreakerOpen(): boolean {
     return this.nowMs() < this.breakerOpenUntilMs;
+  }
+
+  /**
+   * True once a credential failure has stopped the sender (design 6.5).
+   *
+   * Deliberately not self-clearing, unlike the breaker: bad credentials are
+   * fixed by a person, and retrying on a timer would spend the cap on calls
+   * that cannot succeed and bury the page under noise.
+   */
+  get isStopped(): boolean {
+    return this.stoppedReason !== undefined;
   }
 
   /**
@@ -136,6 +149,13 @@ export class SyncWorker {
    */
   async runOnce(maxRecords = 200): Promise<DrainReport> {
     this.reclaimExpiredLeases();
+
+    if (this.isStopped) {
+      // Stopped on a credential failure. Rows stay `pending` with their
+      // attempts intact, so a person fixing the credentials and restarting
+      // loses nothing (design 6.5).
+      return this.emptyReport();
+    }
 
     if (this.isBreakerOpen) {
       // Probe with a single request instead of claiming (design 6.4).
@@ -184,18 +204,23 @@ export class SyncWorker {
     };
   }
 
-  /** Drain until nothing is due, or `maxPasses` is reached. */
-  async drain(maxPasses = 100): Promise<DrainReport> {
-    let total: DrainReport = {
+  /** A report in which nothing happened. */
+  private emptyReport(): DrainReport {
+    return {
       claimed: 0,
       sent: 0,
       skipped: 0,
       throttled: 0,
       endpointFailures: 0,
       rowFailures: 0,
-      breakerOpen: false,
+      breakerOpen: this.isBreakerOpen,
       callsMade: 0,
     };
+  }
+
+  /** Drain until nothing is due, or `maxPasses` is reached. */
+  async drain(maxPasses = 100): Promise<DrainReport> {
+    let total: DrainReport = { ...this.emptyReport(), breakerOpen: false };
     for (let pass = 0; pass < maxPasses; pass += 1) {
       const report = await this.runOnce();
       total = {
@@ -291,7 +316,10 @@ export class SyncWorker {
       this.settle(batch, (row) => {
         row.state = "sent";
         row.sentAtMs = this.nowMs();
-        row.lastError = "nothing owed: sf_value already equals the current value";
+        // `lastError` stays clear: this row succeeded by not needing a call,
+        // and anyone querying `last_error` for trouble should not find
+        // routine skips in it.
+        row.lastError = undefined;
       });
       return "skipped";
     }
@@ -300,6 +328,12 @@ export class SyncWorker {
     // calls we make (design 6.4).
     await this.governor.acquire();
 
+    // Only the call itself is inside the try. A store failure is not an
+    // endpoint failure: counting one toward the breaker would let a disk
+    // problem stop us talking to a Salesforce that is perfectly healthy, and
+    // would report the wrong cause to the caller. Store errors are surfaced,
+    // never swallowed, so the write below is deliberately outside it.
+    let assignedSfId: string | undefined;
     try {
       if (plan.sfId === null) {
         const { sfId } = await this.salesforce.upsertByExternalId(
@@ -307,12 +341,21 @@ export class SyncWorker {
           batch.portalId,
           plan.values,
         );
-        this.store.transaction((tx) => tx.linkSfId(batch.objectType, batch.portalId, sfId));
+        assignedSfId = sfId;
       } else {
         await this.salesforce.update(batch.objectType, plan.sfId, plan.values);
       }
     } catch (error) {
       return this.settleFailure(batch, error);
+    }
+
+    // The call landed. Recording the id it returned may still fail, and that
+    // error propagates: the rows stay `inflight`, their lease expires, and
+    // reclaim retries the upsert — which is safe precisely because it is
+    // idempotent on our own `portalId` (A5, C.1).
+    if (assignedSfId !== undefined) {
+      const sfId = assignedSfId;
+      this.store.transaction((tx) => tx.linkSfId(batch.objectType, batch.portalId, sfId));
     }
 
     // Success. The order of these three matters and they all happen AFTER the
@@ -451,6 +494,26 @@ export class SyncWorker {
         `ALERT: Salesforce refused ${batch.objectType} ${batch.portalId}: ${error.message}`,
       );
       return "row-failure";
+    }
+
+    if (error instanceof SalesforceAuthFailed) {
+      // Design 6.5's 401/403 row: keep the work, restore the attempt, and stop
+      // the sender rather than letting every remaining row burn an attempt on
+      // a call that cannot succeed. This one pages.
+      this.stoppedReason = String(error);
+      this.settle(batch, (row) => {
+        row.state = "pending";
+        row.attempts = Math.max(0, row.attempts - 1);
+        row.nextAttemptAtMs = now;
+        row.leaseOwner = undefined;
+        row.leaseUntilMs = undefined;
+        row.lastError = `auth: ${error.message}`;
+      });
+      process.emitWarning(
+        `PAGE: Salesforce refused our credentials (${error.message}); sender stopped ` +
+          `with work preserved`,
+      );
+      return "endpoint-failure";
     }
 
     // An error we did not anticipate. Treated as an endpoint failure, which is

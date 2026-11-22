@@ -75,6 +75,8 @@ export type EventOutcome =
   | "superseded"
   | "partial"
   | "restatement"
+  /** Every field already held the incoming value, so nothing changed. */
+  | "confirmed"
   | "rejected";
 
 /** Why a row is sitting in the outbound queue. */

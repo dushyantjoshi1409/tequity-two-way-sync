@@ -93,6 +93,7 @@ export class Tx {
       objectType,
       portalId,
       sfId,
+      createdAtMs: this.nowMs(),
       linkedAtMs: sfId === null ? undefined : this.nowMs(),
     });
     return row;
@@ -371,15 +372,13 @@ export class DurableStore {
   transaction<T>(body: (tx: Tx) => T): T {
     const draft = structuredClone(this.state);
     const tx = new Tx(draft, this.nowMs);
-    let result: T;
-    try {
-      result = body(tx);
-    } catch (error) {
-      // Roll back by discarding the draft, then let the caller see the error.
-      // Not swallowed: the caller decides whether this is a 400, a 500, or a
-      // failed send.
-      throw error;
-    }
+    // No try/catch around the body on purpose. The rollback IS the throw: if
+    // `body` raises, this assignment never happens, `this.state` is never
+    // replaced, and the draft is discarded by going out of scope. Catching
+    // only to re-throw would add a line that reads like it handles something
+    // and does not. The caller sees the original error and decides whether it
+    // is a 400, a 500, or a failed send.
+    const result: T = body(tx);
     const previous = this.state;
     this.state = draft;
     try {

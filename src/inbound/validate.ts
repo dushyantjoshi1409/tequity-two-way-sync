@@ -57,14 +57,16 @@ const OBJECT_TYPES: readonly string[] = ["Customer", "Contact"];
  */
 export function verifySignature(rawBody: string, signatureHex: string, secret: string): void {
   const expected = createHmac("sha256", secret).update(rawBody, "utf8").digest();
-  let provided: Buffer;
-  try {
-    provided = Buffer.from(signatureHex, "hex");
-  } catch (cause) {
-    // A signature header that is not even hex is a failed signature, not a
-    // crash. Reported as such rather than allowed to propagate as a TypeError.
-    throw new SignatureInvalid(`signature is not valid hex: ${String(cause)}`);
+
+  // Checked explicitly, because `Buffer.from(s, "hex")` does NOT throw on a
+  // malformed string: it silently drops the invalid bytes, so "zz" would
+  // become an empty buffer. That still fails the comparison below, but for the
+  // wrong reason and with a misleading message. A header that is not hex is a
+  // failed signature, and it says so.
+  if (signatureHex.length % 2 !== 0 || !/^[0-9a-f]*$/i.test(signatureHex)) {
+    throw new SignatureInvalid("signature is not valid hex");
   }
+  const provided = Buffer.from(signatureHex, "hex");
   if (provided.length !== expected.length || !timingSafeEqual(provided, expected)) {
     throw new SignatureInvalid();
   }

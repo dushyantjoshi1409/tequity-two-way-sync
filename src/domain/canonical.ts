@@ -99,7 +99,7 @@ export function canonicalise(
       // a 400 here would discard a real edit forever. The consequence — every
       // echo of a value we cannot normalise reading as a disagreement — is
       // bounded by the repair breaker of design 9.4, which stops the argument
-      // at 5 repairs an hour and marks the field contested.
+      // past 5 repairs in an hour and marks the field contested.
       return text;
     }
 

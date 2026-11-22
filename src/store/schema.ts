@@ -128,6 +128,17 @@ export interface RecordLinkRow {
   readonly portalId: string;
   /** Null until Salesforce assigns one — a portal-created record has no id yet. */
   sfId: string | null;
+  /**
+   * When this link row was minted, set for every row whether or not it has an
+   * `sfId` yet.
+   *
+   * Distinct from {@link linkedAtMs} on purpose: design 5 case (c) bounds how
+   * long we defer a create echo, and "how long has this create been waiting"
+   * is the age of the row, not the time an id was attached — which is by
+   * definition unset for exactly the unlinked rows that bound applies to.
+   */
+  readonly createdAtMs: number;
+  /** When Salesforce's id was attached. Unset while `sfId` is null. */
   linkedAtMs?: number;
 }
 

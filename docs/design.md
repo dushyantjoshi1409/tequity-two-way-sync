@@ -434,3 +434,122 @@ queue would add a component and a lag term to buy headroom we do not need. The
 condition for adding one is explicit: **inbound apply p99 above 1 second, or
 sustained commits above 500/second.** Until then, inlining the apply is
 strictly better, and part 3 is the general form of that argument.
+
+---
+
+## 3. The subproblems, in the order I would build them
+
+### 3.1 How I ordered them
+
+Not by difficulty and not by what the dependency graph forces. By risk, where
+risk is these three things in this order:
+
+1. **Getting it wrong loses data that cannot be recovered.** No retry, no
+   re-sync and no apology fixes a field edit we threw away.
+2. **Getting it wrong is silent.** A failure that announces itself is a
+   different class of problem from one that quietly produces a plausible wrong
+   answer for six months.
+3. **Everything else is built on its decision.** A choice that other code
+   writes against is expensive to revisit, so it should be made while it is
+   still cheap.
+
+Those three put the merge rule first and the backfill last, which is roughly
+the opposite of the order in which the system's data flows — the backfill runs
+before any sync happens, and it is still the last thing I would build, because
+it is one-off, offline and re-runnable.
+
+### 3.2 The subproblems
+
+**S1. Decide what the current value of a field is, and keep what it
+displaced.**
+First because it is the only one that scores on all three criteria. A wrong
+merge rule loses a real edit permanently; it does so silently, because a wrong
+value looks exactly like a right one; and every other write path in the system
+is built against the schema and the comparison this subproblem defines. It is
+also the subproblem the exercise is really about — the phone-and-city scenario
+is a merge question, and everything else is plumbing around the answer.
+
+**S2. Stop a change from going round forever.**
+Second because a loop is the one failure here that amplifies itself. Every
+other bug affects the records it touches; a loop consumes the entire 100 req/s
+budget, which takes the integration down for every record and every user at
+once, and it does so within seconds of being deployed. It ranks above the queue
+because the fix is structural — it is a property of *when outbound work is
+created*, which is a decision inside S1's write path, and retrofitting it means
+revisiting that path.
+
+**S3. Hold outbound work on disk and spend the rate cap.**
+Third. Getting it wrong loses portal edits when our process restarts, which is
+the same severity as S1, but it ranks lower for one reason: it is a
+well-understood pattern with a known shape — a transactional outbox with a
+lease — so the probability of getting it wrong is much lower than the
+probability of getting the merge rule subtly wrong. Risk is severity times
+likelihood, and this is where the likelihood term starts to matter.
+
+**S4. Make inbound delivery safe to repeat and safe to reorder.**
+Fourth, and it cannot be earlier because it is defined in terms of S1's
+comparison — "older" has no meaning until the order key exists. A failure here
+corrupts current values, which is severe, but unlike S1 it is *detectable*: the
+divergence number in part 11 goes up, and the damage is repairable by replaying
+from the watermark. Detectable and repairable is what moves it below the
+first three.
+
+**S5. Know which record is which across the two systems.**
+Fifth. A record created in the portal has no Salesforce identifier yet, and a
+lost create response can produce a second Salesforce record. That is genuinely
+bad — duplicate customer records are cleaned up by hand, by someone's
+colleague — but it is bounded to the records being created, and it is visible
+almost immediately. Bounded and visible is why it sits below the four above it.
+
+**S6. Recover what was missed while a side was dark.**
+Sixth as a thing to *build*, first as a thing to *ask about*. Its failure only
+matters during a rare event and is recoverable by simply running it again,
+which is why it ranks here. But it rests entirely on assumption A4, and if the
+client says there is no changed-since query then the whole inbound design
+changes shape, so the question belongs at the top of the call even though the
+code belongs sixth.
+
+**S7. Prove the webhook came from Salesforce.**
+Seventh by risk and the one place where build order deliberately differs: the
+signature check goes in on day one as a stub and is filled in before anything
+reaches production. It ranks low not because it does not matter but because it
+is a gate rather than a risk — a well-bounded piece of work with a known
+answer, whose failure is a security incident rather than a correctness one, and
+which cannot be gotten subtly wrong in the way S1 can.
+
+**S8. Load the 5 million records that already exist.**
+Last. One-off, offline, no latency target, and fully re-runnable from the
+watermark if it fails halfway. Nothing else depends on its internals. It is
+also the only subproblem whose cost is dominated by local database work rather
+than by the API cap, so it exercises nothing the rest of the design needs
+proven.
+
+### 3.3 Which components each subproblem brings, and which bring none
+
+A component appears here only because a subproblem above needed it. Four of the
+eight need nothing new, which is the point of ordering the work this way.
+
+| Subproblem | What it adds | What it adds to the running system |
+| --- | --- | --- |
+| S1 | the MERGE module; `field_version`, `field_change`, and the typed `customer` / `contact` tables | the only new module with real depth |
+| S2 | the canonicalisation rule, and `echo_fence` | **no new process.** Loop termination is a property of MERGE, not a component |
+| S3 | `outbound_change`; the SYNC WORKER process; the rate governor; `SalesforceClient` | the second process, and the only seam with two adapters |
+| S4 | `inbound_event`; the WEBHOOK ENDPOINT process | the first process |
+| S5 | `record_link` | **no new process** |
+| S6 | `sync_watermark`, and a sweep that runs inside the existing worker | **no new process** |
+| S7 | signature-verification middleware in the endpoint | **no new process** |
+| S8 | a one-off script | **nothing.** It is not part of the running system |
+
+What I am deliberately *not* adding, each tied to the subproblem that would
+have to exist first to justify it:
+
+- **No message broker.** S3 needs durability, and Postgres gives it without
+  breaking the one-transaction property of ADR 0001.
+- **No inbound queue.** S4's apply is one short transaction at 14 commits a
+  second. Part 2.4 states the number at which I would add one.
+- **No cache in front of Postgres.** Nothing in the design reads hot enough to
+  need it, and a cache between MERGE and its row locks would be actively
+  dangerous.
+- **No per-field ownership table.** That is open question 6; if some fields
+  turn out to be single-owner, S1 gets simpler for those fields, and a table
+  built before the answer would be a guess.

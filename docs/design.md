@@ -1948,3 +1948,177 @@ and the lag of `sync_watermark` behind now (whether the nightly sweep of part
 One deliberate omission: there is no alert on queue *depth*. During catch-up
 the depth is supposed to be 19,000, and an alert that fires every time the
 system does its job correctly is an alert people learn to close.
+
+---
+
+## 12. What I am leaving out of this weekend's work
+
+### Out of scope because the exercise says so
+
+Deletes (A15), Salesforce login and authorisation screens, any visual user
+interface, a second region, and load testing against real Salesforce. Where
+code exists it runs against a fake Salesforce I wrote.
+
+### Out of scope because I chose to leave it out
+
+Each of these is a real thing the client would eventually need. I am naming
+them with what they would cost rather than letting them be discovered later.
+
+| Left out | What it would take | Why it can wait |
+| --- | --- | --- |
+| **The initial backfill of 5 million records** | designed as S8 in part 3 and costed in part 10.6 — 2,500 query requests, about 40 seconds of API budget, 17 minutes of local merge | one-off, offline, re-runnable, and it needs the merge rule to exist first |
+| **Salesforce authentication lifecycle** | a connected app, a refresh token, and rotation. Assumed working throughout | mechanical, well-documented, and no design decision rests on it |
+| **Schema change handling** | a picklist value the client adds in Salesforce that our canonicalisation does not know (part 7.3) | part 9.5's repair breaker degrades safely into a contested field and an alert rather than a loop |
+| **Merging records that are already duplicated** | a matching rule, and a way to fold two histories into one | a pre-existing data-quality problem, not one this sync creates |
+| **Field-level permissions** | a table of who may edit what, enforced on both paths | open question 6; building it before the answer would be a guess |
+| **Attachments, notes, files, and every object beyond the nine fields** | more of the same machinery, keyed the same way | A14; nothing in the design is written per field, so a tenth field is configuration |
+| **The portal's overwrite notice** (part 7.5) | a read-after-save and an inline message | the rule and the data behind it are designed; it is the UI that is out of scope |
+| **Right-to-erasure against permanent history** | a decision, then probably crypto-shredding of the values with the change records kept | open question 5, and it is a legal question before it is an engineering one |
+| **The monitoring itself** | wiring part 11's three numbers into whatever the client already uses | the queries are in part 11; the plumbing is site-specific |
+
+### What I would build first if this were real work
+
+In the order of part 3, and the first week would be S1 and S2 alone — the merge
+rule, the history, the canonical forms, and the single condition that creates
+outbound work — tested against a fake Salesforce, with no real integration
+connected at all. Everything after that is plumbing around a decision that has
+to be right first.
+
+The single most valuable thing I could do before writing any of it is get open
+question 1 answered: **how is the webhook actually produced?** If it is Change
+Data Capture, replay ids give a real sequence, which retires A11, strengthens
+part 8.2 from ordering-what-arrived to detecting-what-is-missing, and makes the
+recovery sweep a replay instead of a comparison. That one answer changes more
+of this document than any other.
+
+---
+
+## Appendix A: the exercise's worked scenario, traced
+
+The scenario from the brief — sales creates a customer, finance corrects the
+city in the portal, sales then changes the phone in Salesforce, and the portal
+must end with **the new phone and the finance city** — traced through every
+rule, with a duplicate and a late event added so all four required rules
+appear. The contact is `0031A00000Abc` in Salesforce and `P` in the portal.
+
+### Step 1 — sales creates the contact in Salesforce
+
+`evt_1`, `occurredAt 11:00:00.000`, `changedBy sales.user@client.example`.
+
+The Salesforce id is unknown and `changedBy` is a human, so part 5.2 case (b):
+mint `P`, write the `record_link`, apply every field as a first write. The
+email `ASHA@Client.example` is canonicalised to `asha@client.example` (7.3).
+
+```
+contact        full_name="Asha Mehta"  phone="+919876500001"  city="Gurugram"
+field_version  every field = (11:00:00.000, rank 1, evt_1)
+sf_value       every field = the value just applied,  sf_observed_at = 11:00:00.000
+condition (d)  sf_value = current for every field          -> 0 outbound rows
+```
+
+### Step 2 — finance corrects the city in the portal
+
+A finance user saves `{"city": "Noida"}`. Per A9 the time is our database's
+`clock_timestamp()` — `11:00:20.000` — and the actor is the authenticated
+session, **not** the `editedBy` in the body. The portal change id is `pc_01`.
+
+```
+order key  (11:00:20.000, rank 0, pc_01) > (11:00:00.000, rank 1, evt_1)   -> APPLIED
+contact.city  := "Noida"
+field_change  += (city, "Gurugram" -> "Noida", finance.user, 11:00:20.000, applied)
+condition (d) sf_value "Gurugram" <> current "Noida"       -> 1 outbound row
+```
+
+### Step 3 — the sync worker sends it
+
+Claims the row, reads the **current** value at send time (6.3), sends one
+`PATCH {City: "Noida"}`, gets a 2xx, writes `echo_fence(P, city, hash("Noida"))`
+and marks the row `sent`. **This is the only outbound call in the entire
+scenario.**
+
+### Step 4 — Salesforce echoes our own write
+
+`evt_2`, `occurredAt 11:00:25.000`, `changedBy integration.user@tequity`,
+`{"city": "Noida"}`. This is the loop rule.
+
+```
+dedup       new eventId, claimed
+L2          changedBy is the integration user                  -> classified ECHO
+(a)         11:00:25.000 > 11:00:00.000  -> sf_value[city] := "Noida"
+(c)         echo: no comparison, no value change; sync_observation('echo')
+(d)         sf_value "Noida" = current "Noida"                 -> 0 outbound rows
+```
+
+The loop ends here, and part 9.2 is why: there is nothing left to disagree
+about. Had L2 been unavailable (A6 false), the echo would have been a
+`confirmed` observation and (d) would still have produced nothing.
+
+### Step 5 — sales changes the phone in Salesforce
+
+`evt_3`, `occurredAt 11:05:00.000`, `changedBy sales.user`,
+`{"phone": "+919876500002"}`. Changed-fields-only (A3), so `city` is not in the
+payload and is never looked at.
+
+```
+(a)  11:05:00.000 > 11:00:00.000  -> sf_value[phone] := "+919876500002"
+(c)  (11:05:00.000, 1, evt_3) > (11:00:00.000, 1, evt_1)      -> APPLIED
+     contact.phone := "+919876500002"
+     field_change += (phone, "+919876500001" -> "+919876500002", sales.user, applied)
+(d)  sf_value = current                                        -> 0 outbound rows
+```
+
+### Step 6 — Salesforce delivers `evt_3` a second time
+
+```
+INSERT ... ON CONFLICT (event_id) DO NOTHING  -> 0 rows  -> 200 {"status":"duplicate"}
+```
+
+Nothing happens, and nothing is alerted — A7 permits this. And if
+`inbound_event` had been pruned, layer 2 of part 8.1 still holds: the order key
+would be *equal*, not greater, so (c) applies nothing, `sf_observed_at` is not
+advanced by (a), and (d) finds nothing owed. Harmless either way.
+
+### Step 7 — an older phone event arrives late
+
+`evt_0`, `occurredAt 11:04:00.000` — earlier than `evt_3`, delivered after it —
+`{"phone": "+919876500000"}`.
+
+```
+(a)  11:04:00.000 is NOT > sf_observed_at 11:05:00.000
+     -> sf_value LEFT ALONE. We already know a newer Salesforce state.
+(c)  (11:04:00.000, 1, evt_0) < (11:05:00.000, 1, evt_3)      -> SUPERSEDED
+     field_change += (phone, "+919876500000", sales.user, 11:04:00.000, superseded)
+     the current value stays "+919876500002"
+(d)  sf_value "+919876500002" = current                        -> 0 outbound rows
+```
+
+Step (a) is the whole reason this costs nothing. A repair rule that compared
+the incoming value against ours would have fired here and wasted a call, since
+`evt_0` describes a past state of Salesforce rather than its current one. This
+is the bug part 8.3 exists to prevent.
+
+### The result
+
+```
+contact P   phone = "+919876500002"      <- sales, 11:05:00
+            city  = "Noida"              <- finance, 11:00:20
+```
+
+**The new phone and the finance city**, which is exactly what the brief
+requires. The history the client asked for, in `field_change`:
+
+| field | old | new | occurred_at | actor | origin | outcome |
+| --- | --- | --- | --- | --- | --- | --- |
+| city | — | Gurugram | 11:00:00.000 | sales.user | salesforce | applied |
+| phone | — | +919876500001 | 11:00:00.000 | sales.user | salesforce | applied |
+| city | Gurugram | **Noida** | 11:00:20.000 | **finance.user** | portal | applied |
+| phone | +919876500001 | **+919876500002** | 11:05:00.000 | **sales.user** | salesforce | applied |
+| phone | — | +919876500000 | 11:04:00.000 | sales.user | salesforce | superseded |
+
+"Who changed the phone, and who changed the city" is one indexed read each. The
+earlier values survive the later edits, and the late event that lost is on
+record rather than discarded.
+
+**Seven events, one outbound call.** The duplicate cost nothing, the echo cost
+nothing, the late event cost nothing, and the only request we spent against the
+rate cap was the one that carried real news to Salesforce.
